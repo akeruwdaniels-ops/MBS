@@ -93,7 +93,7 @@ MARTINGALE_MAX_STEPS = 4               # up to 3 recovery steps after the initia
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
-HISTORY_BOOTSTRAP_COUNT = 10,000                 # ticks fetched per symbol at startup
+HISTORY_BOOTSTRAP_COUNT = 10000                 # ticks fetched per symbol at startup
 
 CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only — real threshold set adaptively
                                         # (see ADAPTIVE_THRESHOLD_PERCENTILE below)
