@@ -135,8 +135,8 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.24
-MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
+MARTINGALE_FACTOR = 1.6
+MARTINGALE_MAX_STEPS = 6               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
@@ -154,7 +154,7 @@ MIN_SCORE_GAP = 0.05
 # 12/16 layers must agree (75% supermajority). No more than 3 allowed to
 # actively oppose. This eliminates all the 9-agree / 5-disagree borderline
 # entries that the logs showed were the source of losses.
-MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
+MIN_LAYER_AGREE    = 11                # minimum layers voting FOR direction (75% of 16)
 MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
@@ -172,7 +172,7 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # the next entry. No rate limiter — every loss gets a fresh recal.
 POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
 CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks — Deriv only accepts 1-10 tick contracts
-MC_SIMULATIONS = 500
+MC_SIMULATIONS = 1000
 
 WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
                                         # before the bot force-restarts itself in place
