@@ -77,7 +77,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
-DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "real").strip().lower()
+DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
 DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
 
 # ── Connection (new Deriv Options API) ──
@@ -88,12 +88,12 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.4
-MARTINGALE_MAX_STEPS = 4               # up to 3 recovery steps after the initial stake
+MARTINGALE_FACTOR = 1.24
+MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
-HISTORY_BOOTSTRAP_COUNT = 9000                 # ticks fetched per symbol at startup
+HISTORY_BOOTSTRAP_COUNT = 3000                 # ticks fetched per symbol at startup
 
 CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only — real threshold set adaptively
                                         # (see ADAPTIVE_THRESHOLD_PERCENTILE below)
@@ -104,11 +104,10 @@ CONFIDENCE_THRESHOLD_DEFAULT = 0.11    # fallback only — real threshold set ad
 MIN_SCORE_GAP = 0.05
 
 # ── Layer agreement gate ──────────────────────────────────────────────────
-# 12/17 layers must agree (≈70.6% supermajority). No more than 3 allowed to
-# actively oppose. MBS (multi-bar structure) is additionally a mandatory-agree
-# layer with a structural veto: if it actively opposes the direction the trade
-# is blocked regardless of how many other layers agree.
-MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (12/17 ≈ 70.6%)
+# 12/16 layers must agree (75% supermajority). No more than 3 allowed to
+# actively oppose. This eliminates all the 9-agree / 5-disagree borderline
+# entries that the logs showed were the source of losses.
+MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
 MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
@@ -126,7 +125,7 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # the next entry. No rate limiter — every loss gets a fresh recal.
 POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
 CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks — Deriv only accepts 1-10 tick contracts
-MC_SIMULATIONS = 1000
+MC_SIMULATIONS = 500
 
 WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
                                         # before the bot force-restarts itself in place
@@ -1007,266 +1006,6 @@ def detect_jumps(returns, threshold_sigma=2.5):
     return intensity, float(jump_dir), float(post_jump)
 
 
-# ---------------------------------------------------------------------------
-# SYNTHETIC BAR BUILDER
-# ---------------------------------------------------------------------------
-def build_synthetic_bars(prices, bar_size=5):
-    """Aggregate tick prices into fixed-tick synthetic OHLC bars.
-
-    Each bar covers exactly `bar_size` ticks.  Using a fixed tick count
-    (rather than fixed time) is correct for Deriv synthetic indices because
-    tick spacing is nearly constant (~2 s) and we always have a consistent
-    number of ticks to work with regardless of wall-clock time.
-
-    Returns a list of dicts, newest bar last:
-        { 'open': float, 'high': float, 'low': float, 'close': float,
-          'body': float,   # close - open  (signed)
-          'range': float,  # high - low    (always >= 0)
-          'upper_wick': float,  # high - max(open, close)
-          'lower_wick': float,  # min(open, close) - low
-        }
-    Fewer than 2 complete bars → returns [].
-    """
-    n_bars = len(prices) // bar_size
-    if n_bars < 2:
-        return []
-    bars = []
-    for i in range(n_bars):
-        chunk = prices[i * bar_size:(i + 1) * bar_size]
-        o, h, l, c = chunk[0], np.max(chunk), np.min(chunk), chunk[-1]
-        body        = c - o
-        bar_range   = h - l
-        upper_wick  = h - max(o, c)
-        lower_wick  = min(o, c) - l
-        bars.append({
-            "open": o, "high": h, "low": l, "close": c,
-            "body": body, "range": bar_range,
-            "upper_wick": upper_wick, "lower_wick": lower_wick,
-        })
-    return bars
-
-
-# ---------------------------------------------------------------------------
-# MULTI-BAR PATTERN DETECTION  (institutional market structure)
-# ---------------------------------------------------------------------------
-def multi_bar_structure_signal(prices, bar_size=5, swing_lookback=6):
-    """Institutional-grade market structure analysis on synthetic OHLC bars.
-
-    Combines two complementary frameworks:
-
-    1. SWING STRUCTURE (price geometry — dominant signal weight 0.60)
-       Higher High / Higher Low  → bullish structure  → vote UP
-       Lower High  / Lower Low   → bearish structure  → vote DOWN
-       Break of Structure (BOS)  → continuation bias  (+0.30 addition)
-       Change of Character(CHoCH)→ early reversal bias (+0.20 addition)
-
-    2. MULTI-BAR CANDLESTICK PATTERNS (confirmation — weight 0.40)
-       Engulfing (bullish/bearish)  : strong reversal signal
-       Inside bar                   : neutral (breakout pending, skip)
-       Pin bar / hammer / shooting  : rejection / mean-reversion signal
-       Three-bar reversal sequence  : high-conviction reversal
-
-    RETURN VALUE
-    ─────────────
-    signal  : float in [-1, +1]
-                +1  = very strong bullish structure (all sub-signals agree UP)
-                -1  = very strong bearish structure (all sub-signals agree DOWN)
-                 0  = no clear institutional structure
-    detail  : dict with sub-component scores for the explain_signal log
-
-    A signal of exactly 0.0 means "no pattern detected" — the layer will
-    vote neutral and NOT count toward agree/disagree.  That is intentional:
-    we only want to participate in the vote when there is a real structural
-    read, not pad the count with noise.
-    """
-    bars = build_synthetic_bars(prices, bar_size=bar_size)
-    MIN_BARS = swing_lookback + 3
-    if len(bars) < MIN_BARS:
-        return 0.0, {"reason": "insufficient_bars", "n_bars": len(bars)}
-
-    # ── 1. SWING STRUCTURE ────────────────────────────────────────────────
-    # Identify swing highs and swing lows using a 1-bar left/right lookaround
-    # on bar closes.  We work on the last `swing_lookback` bars so the signal
-    # stays current and fast.
-    recent = bars[-swing_lookback:]
-    closes = np.array([b["close"] for b in recent])
-    highs  = np.array([b["high"]  for b in recent])
-    lows   = np.array([b["low"]   for b in recent])
-
-    swing_highs = []  # (bar_index, high_price)
-    swing_lows  = []  # (bar_index, low_price)
-    for i in range(1, len(recent) - 1):
-        if highs[i] > highs[i - 1] and highs[i] > highs[i + 1]:
-            swing_highs.append((i, highs[i]))
-        if lows[i] < lows[i - 1] and lows[i] < lows[i + 1]:
-            swing_lows.append((i, lows[i]))
-
-    structure_signal = 0.0
-    bos_signal       = 0.0
-    choch_signal     = 0.0
-
-    if len(swing_highs) >= 2 and len(swing_lows) >= 2:
-        last_hh_hi   = swing_highs[-1][1]
-        prev_hh_hi   = swing_highs[-2][1]
-        last_ll_lo   = swing_lows[-1][1]
-        prev_ll_lo   = swing_lows[-2][1]
-
-        hh = last_hh_hi > prev_hh_hi   # Higher High
-        lh = last_hh_hi < prev_hh_hi   # Lower High
-        hl = last_ll_lo > prev_ll_lo   # Higher Low
-        ll = last_ll_lo < prev_ll_lo   # Lower Low
-
-        # Confirmed bullish structure: HH + HL
-        if hh and hl:
-            structure_signal = +1.0
-        # Confirmed bearish structure: LH + LL
-        elif lh and ll:
-            structure_signal = -1.0
-        # Partial bullish (HH only or HL only) → weaker signal
-        elif hh:
-            structure_signal = +0.5
-        elif hl:
-            structure_signal = +0.4
-        # Partial bearish
-        elif lh:
-            structure_signal = -0.5
-        elif ll:
-            structure_signal = -0.4
-
-        # ── Break of Structure (BOS): current close breaks the last swing
-        #    extreme in the direction of existing structure ─────────────────
-        current_close = closes[-1]
-        if structure_signal > 0 and current_close > last_hh_hi:
-            bos_signal = +0.30   # bullish BOS: price broke above last swing high
-        elif structure_signal < 0 and current_close < last_ll_lo:
-            bos_signal = -0.30   # bearish BOS: price broke below last swing low
-
-        # ── Change of Character (CHoCH): structure break in OPPOSITE direction
-        #    e.g. in a bearish structure, price breaks above last swing high ──
-        if structure_signal < 0 and current_close > last_hh_hi:
-            choch_signal = +0.20   # bullish CHoCH — early reversal hint
-        elif structure_signal > 0 and current_close < last_ll_lo:
-            choch_signal = -0.20   # bearish CHoCH — early reversal hint
-
-    # If CHoCH fires it overrides BOS (they're mutually exclusive on same bar)
-    if choch_signal != 0.0:
-        bos_signal = 0.0
-
-    swing_composite = float(np.clip(
-        structure_signal + bos_signal + choch_signal, -1.0, 1.0
-    ))
-
-    # ── 2. MULTI-BAR CANDLESTICK PATTERNS ────────────────────────────────
-    # Work on the last 4 bars (enough for 3-bar patterns + current context).
-    pattern_signal = 0.0
-    b  = bars     # full bar list (read-only alias)
-    n  = len(b)
-
-    avg_range = float(np.mean([x["range"] for x in b[-10:]])) if n >= 10 else \
-                float(np.mean([x["range"] for x in b])) + 1e-9
-    if avg_range == 0:
-        avg_range = 1e-9
-
-    # Helpers
-    def is_bullish(bar): return bar["body"] > 0
-    def is_bearish(bar): return bar["body"] < 0
-    def body_pct(bar):   return abs(bar["body"]) / (bar["range"] + 1e-9)
-
-    # ── Bullish engulfing (last two bars) ─────────────────────────────────
-    if n >= 2:
-        prev, curr = b[-2], b[-1]
-        if (is_bearish(prev) and is_bullish(curr)
-                and curr["close"] > prev["open"]
-                and curr["open"]  < prev["close"]
-                and body_pct(curr) > 0.55):
-            pattern_signal = max(pattern_signal, +0.80)
-
-    # ── Bearish engulfing ─────────────────────────────────────────────────
-    if n >= 2:
-        prev, curr = b[-2], b[-1]
-        if (is_bullish(prev) and is_bearish(curr)
-                and curr["close"] < prev["open"]
-                and curr["open"]  > prev["close"]
-                and body_pct(curr) > 0.55):
-            pattern_signal = min(pattern_signal, -0.80)
-
-    # ── Inside bar — skip (breakout direction unknown, vote neutral) ──────
-    if n >= 2:
-        prev, curr = b[-2], b[-1]
-        inside = (curr["high"] < prev["high"] and curr["low"] > prev["low"])
-        if inside:
-            pattern_signal = 0.0   # force neutral — cannot determine breakout bias
-
-    # ── Bullish pin bar (hammer): long lower wick, small body at top ──────
-    if n >= 1:
-        curr = b[-1]
-        wick_body_ratio = curr["lower_wick"] / (abs(curr["body"]) + 1e-9)
-        if (curr["lower_wick"] > 0.60 * curr["range"]
-                and wick_body_ratio > 2.0
-                and curr["range"] > 0.5 * avg_range):
-            pin_strength = float(np.clip(
-                curr["lower_wick"] / curr["range"] * 1.2, 0, 1
-            ))
-            pattern_signal = max(pattern_signal, +pin_strength * 0.70)
-
-    # ── Bearish pin bar (shooting star): long upper wick, small body ──────
-    if n >= 1:
-        curr = b[-1]
-        wick_body_ratio = curr["upper_wick"] / (abs(curr["body"]) + 1e-9)
-        if (curr["upper_wick"] > 0.60 * curr["range"]
-                and wick_body_ratio > 2.0
-                and curr["range"] > 0.5 * avg_range):
-            pin_strength = float(np.clip(
-                curr["upper_wick"] / curr["range"] * 1.2, 0, 1
-            ))
-            pattern_signal = min(pattern_signal, -pin_strength * 0.70)
-
-    # ── Three-bar bullish reversal (3 consecutive closes rising, last bar
-    #    body > avg_range * 0.4, and first bar was bearish) ─────────────
-    if n >= 3:
-        b1, b2, b3 = b[-3], b[-2], b[-1]
-        if (is_bearish(b1)
-                and b2["close"] > b1["close"]
-                and b3["close"] > b2["close"]
-                and abs(b3["body"]) > 0.4 * avg_range):
-            pattern_signal = max(pattern_signal, +0.75)
-
-    # ── Three-bar bearish reversal ─────────────────────────────────────────
-    if n >= 3:
-        b1, b2, b3 = b[-3], b[-2], b[-1]
-        if (is_bullish(b1)
-                and b2["close"] < b1["close"]
-                and b3["close"] < b2["close"]
-                and abs(b3["body"]) > 0.4 * avg_range):
-            pattern_signal = min(pattern_signal, -0.75)
-
-    pattern_signal = float(np.clip(pattern_signal, -1.0, 1.0))
-
-    # ── COMPOSITE: weighted blend of structure and pattern ─────────────────
-    # Structure gets higher weight because it defines the macro bias;
-    # candlestick patterns confirm or time the entry.
-    #   swing_composite == 0  → no structural read → overall signal = 0
-    #     (pattern alone is insufficient to open a position)
-    if swing_composite == 0.0:
-        composite = 0.0
-    else:
-        composite = float(np.clip(
-            0.60 * swing_composite + 0.40 * pattern_signal,
-            -1.0, 1.0
-        ))
-
-    detail = {
-        "structure":  swing_composite,
-        "bos":        bos_signal,
-        "choch":      choch_signal,
-        "pattern":    pattern_signal,
-        "composite":  composite,
-        "n_bars":     len(bars),
-        "bar_size":   bar_size,
-    }
-    return composite, detail
-
-
 def fit_garch(returns, scale=1000.0):
     if len(returns) < MIN_TICKS_FOR_FIT:
         return None
@@ -1464,13 +1203,6 @@ def compute_features(sd, models, returns_window_dict):
     # Expressed as a centred signal so it contributes its own log-odds term
     hurst_signal = float(np.clip((h - 0.5) * 4, -1, 1))   # +1 at H=0.75, -1 at H=0.25
 
-    # ── Multi-bar institutional market structure (must-agree layer) ───────
-    # Requires at least 10 complete bars (50 ticks at bar_size=5) to vote.
-    # Returns 0.0 when there is no clear structural read — in that case the
-    # layer is neutral and does NOT count toward agree/disagree.  It only
-    # contributes a directional vote when a real institutional pattern exists.
-    mbs_signal, mbs_detail = multi_bar_structure_signal(prices, bar_size=5, swing_lookback=6)
-
     # ── Layer agreement pre-computation ──────────────────────────────────
     # Compute agree/disagree counts here (not just in explain_signal) so the
     # main loop can enforce the MIN_LAYER_AGREE / MAX_LAYER_DISAGREE gates
@@ -1493,7 +1225,6 @@ def compute_features(sd, models, returns_window_dict):
         te_signal,                       # Transfer entropy
         jump_dir * jump_intensity,       # Jump direction
         post_jump * jump_intensity,      # Post-jump reversion
-        mbs_signal,                      # Multi-bar institutional structure
     ]
     # agree_up / disagree_up: counts from the perspective of a CALL trade
     _agree_up    = sum(1 for v in _layer_votes if v > 0)
@@ -1530,9 +1261,6 @@ def compute_features(sd, models, returns_window_dict):
         "jump_intensity": jump_intensity,
         "jump_dir":     jump_dir,
         "post_jump":    post_jump,
-        # multi-bar institutional market structure
-        "mbs_signal":   mbs_signal,
-        "mbs_detail":   mbs_detail,
         # pass through for calibration weight lookup
         "per_layer_weights": models.per_layer_weights,
         # layer vote counts (direction-agnostic: agree_up = votes for CALL)
@@ -1601,10 +1329,6 @@ def bayesian_fusion(features):
         # Jump: during jump use jump_dir, post-jump use reversion signal
         (features["jump_dir"]    * features["jump_intensity"], W("jump",     0.25)),
         (features["post_jump"]   * features["jump_intensity"], W("post_jump",0.20)),
-        # Multi-bar institutional structure — higher weight than confirmation
-        # layers because it encodes geometric price structure, not just stats.
-        # Neutral (0.0) when no pattern exists, so it never dilutes the signal.
-        (features["mbs_signal"]  * 2.0,                        W("mbs",      0.55)),
     ]
 
     total_trust = features["vol_trust"] * features["entropy_trust"]
@@ -1654,13 +1378,35 @@ def monte_carlo_duration(prices, returns, direction, feats, candidate_durations,
 
     empirical = getattr(models, "empirical_duration_win_rates", {}) if models else {}
 
+    # ── Terminal displacement model ───────────────────────────────────────
+    # Deriv Rise/Fall settles on price[expiry] vs price[entry]. The correct
+    # model for the terminal displacement after `dur` independent ticks is:
+    #
+    #   X_T ~ N(drift * dur, vol * sqrt(dur))
+    #
+    # The old approach summed `dur` individual N(drift, vol) draws, which is
+    # mathematically identical to N(drift*dur, vol*sqrt(dur)) for the terminal
+    # value BUT it was computing wins as sum(steps)>0 rather than sampling from
+    # the correct terminal distribution — introducing a monotone duration bias
+    # where longer durations always won because drift accumulated faster than
+    # noise. Synthetic index RNG drift is effectively zero by design, so with
+    # drift≈0 all durations produce ~50% in simulation and the empirical 30%
+    # blend from deep calibration becomes the ONLY real differentiator.
     best = None
     for dur in candidate_durations:
-        steps = np.random.normal(drift + reversion_pull, vol, size=(n_sims, dur))
-        path_totals = np.sum(steps, axis=1)
-        wins = np.sum(path_totals > 0) if direction > 0 else np.sum(path_totals < 0)
+        # Sample terminal displacement directly — no tick-by-tick accumulation
+        terminal = np.random.normal(
+            (drift + reversion_pull) * dur,   # expected drift over dur ticks
+            vol * np.sqrt(dur),               # vol scales as sqrt(ticks)
+            size=n_sims
+        )
+        wins = np.sum(terminal > 0) if direction > 0 else np.sum(terminal < 0)
         sim_win_rate = wins / n_sims
-        blended = 0.70 * sim_win_rate + 0.30 * empirical[dur] if dur in empirical and empirical[dur] > 0 else sim_win_rate
+        # Empirical rates from deep-cal walk-forward are the primary signal;
+        # simulation contributes 30% as a regime-adjusted overlay.
+        blended = (0.30 * sim_win_rate + 0.70 * empirical[dur]
+                   if dur in empirical and empirical[dur] > 0
+                   else sim_win_rate)
         if best is None or blended > best[1]:
             best = (dur, blended)
     return best
@@ -1678,13 +1424,7 @@ def passes_layer_gate(feats, direction):
 
     Gate: agree >= MIN_LAYER_AGREE AND disagree <= MAX_LAYER_DISAGREE.
     A trade with 10 agree / 4 disagree clears; one with 7 agree / 7 disagree
-    does not regardless of how high the Bayesian confidence score is.
-
-    MANDATORY MBS GATE: the multi-bar structure layer must either
-      (a) agree with the trade direction (mbs_signal * direction > 0), OR
-      (b) be neutral (mbs_signal == 0.0, meaning no pattern detected yet).
-    If mbs_signal actively opposes the direction the trade is blocked outright,
-    regardless of how many other layers agree.  This is the structural veto."""
+    does not regardless of how high the Bayesian confidence score is."""
     if direction > 0:
         agree    = feats["agree_up"]
         disagree = feats["disagree_up"]
@@ -1692,13 +1432,6 @@ def passes_layer_gate(feats, direction):
         agree    = feats["disagree_up"]   # votes against CALL = votes FOR PUT
         disagree = feats["agree_up"]
     neutral  = feats["n_neutral"]
-
-    # ── Mandatory MBS structural veto ──────────────────────────────────────
-    mbs = feats.get("mbs_signal", 0.0)
-    mbs_actively_opposes = (mbs * direction < 0)   # non-zero signal pointing wrong way
-    if mbs_actively_opposes:
-        return False, agree, disagree, neutral
-
     passes   = (agree >= MIN_LAYER_AGREE) and (disagree <= MAX_LAYER_DISAGREE)
     return passes, agree, disagree, neutral
 
@@ -1796,7 +1529,6 @@ def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win
         ("Transfer entropy",feats["te_signal"]),
         ("Jump direction",  feats["jump_dir"] * feats["jump_intensity"]),
         ("Post-jump rev",   feats["post_jump"] * feats["jump_intensity"]),
-        ("MBS structure",   feats.get("mbs_signal", 0.0)),
     ]
 
     # Sort by absolute contribution, strongest first
@@ -1820,20 +1552,6 @@ def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win
                     else "MODERATE" if feats["entropy_trust"] < 0.65
                     else "low — market is structured")
 
-    mbs_d    = feats.get("mbs_detail", {})
-    mbs_sig  = feats.get("mbs_signal", 0.0)
-    mbs_desc = (f"BULLISH  (structure={mbs_d.get('structure',0):+.2f} "
-                f"bos={mbs_d.get('bos',0):+.2f} "
-                f"choch={mbs_d.get('choch',0):+.2f} "
-                f"pattern={mbs_d.get('pattern',0):+.2f})"
-                if mbs_sig > 0 else
-                f"BEARISH  (structure={mbs_d.get('structure',0):+.2f} "
-                f"bos={mbs_d.get('bos',0):+.2f} "
-                f"choch={mbs_d.get('choch',0):+.2f} "
-                f"pattern={mbs_d.get('pattern',0):+.2f})"
-                if mbs_sig < 0 else
-                f"NEUTRAL  (no pattern — bars={mbs_d.get('n_bars','?')})")
-
     print(f"\n{sep}")
     print(f"  TRADE SIGNAL  {ts}")
     print(sep)
@@ -1847,7 +1565,6 @@ def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win
     print(f"    HMM trend_weight={feats['trend_weight']:.2f}  → {hmm_regime}")
     print(f"    Volatility state → {vol_state}")
     print(f"    Entropy state    → {entropy_state}")
-    print(f"    MBS structure    → {mbs_desc}")
     print(f"\n  Layer breakdown  [{agree} agree | {disagree} disagree | {neutral} neutral]")
     print(f"  {'Layer':<20}  {'Signal':>7}  {'Direction bar (±1)':^22}")
     print(f"  {'-'*20}  {'-'*7}  {'-'*22}")
