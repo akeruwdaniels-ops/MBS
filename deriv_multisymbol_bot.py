@@ -131,7 +131,7 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.35
+MARTINGALE_FACTOR = 1.24
 MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
@@ -150,8 +150,8 @@ MIN_SCORE_GAP = 0.05
 # 12/16 layers must agree (75% supermajority). No more than 3 allowed to
 # actively oppose. This eliminates all the 9-agree / 5-disagree borderline
 # entries that the logs showed were the source of losses.
-MIN_LAYER_AGREE    = 11                # minimum layers voting FOR direction (75% of 16)
-MAX_LAYER_DISAGREE = 1                 # maximum layers allowed to vote AGAINST
+MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
+MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
 # Raised from 0.45 → 0.52: the best simulated duration must show a meaningful
@@ -167,7 +167,7 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # After ANY loss, trigger a full deep recalibration across all symbols before
 # the next entry. No rate limiter — every loss gets a fresh recal.
 POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
-CANDIDATE_DURATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # ticks — Deriv only accepts 1-10 tick contracts
+CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks — Deriv only accepts 1-10 tick contracts
 MC_SIMULATIONS = 50000
 
 WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
@@ -386,7 +386,7 @@ class SymbolModels:
 
 
 class SymbolData:
-    def __init__(self, symbol, maxlen=4000, tick_dt=2.0):
+    def __init__(self, symbol, maxlen=12000, tick_dt=2.0):
         self.symbol = symbol
         self.tick_dt = tick_dt          # seconds per tick: 1.0 for 1HZ, ~2.0 for R_
         self.ticks = deque(maxlen=maxlen)  # (epoch, price)
@@ -733,11 +733,45 @@ async def select_top_1hz(client, n_top=3):
 
 
 async def fetch_history(client, symbol, count=HISTORY_BOOTSTRAP_COUNT):
-    resp = await client.send({"ticks_history": symbol, "count": count, "end": "latest", "style": "ticks"})
-    history = resp.get("history", {})
-    times = history.get("times", [])
-    prices = history.get("prices", [])
-    return list(zip(times, prices))
+    """Fetch up to `count` ticks by paging backwards in time.
+    Deriv's ticks_history API hard-caps each response at 1000 ticks regardless
+    of the count parameter — confirmed in live logs (always returns 1000).
+    We work around this by making ceil(count/1000) sequential calls, each time
+    using the earliest timestamp from the previous batch as the new `end` value
+    so the next call fetches the 1000 ticks immediately before that point."""
+    BATCH = 1000
+    all_ticks = []
+    end = "latest"
+
+    while len(all_ticks) < count:
+        resp = await client.send({
+            "ticks_history": symbol,
+            "count": BATCH,
+            "end": end,
+            "style": "ticks",
+        })
+        history = resp.get("history", {})
+        times  = history.get("times",  [])
+        prices = history.get("prices", [])
+        if not times:
+            break   # no more history available
+
+        batch = list(zip(times, prices))
+        # Prepend so earlier ticks come first in final list
+        all_ticks = batch + all_ticks
+
+        if len(batch) < BATCH:
+            break   # API returned fewer than requested — we've hit the start of available history
+
+        # Next call: fetch ticks ending just before the earliest tick in this batch
+        earliest_epoch = int(times[0]) - 1
+        end = earliest_epoch
+
+    # Trim to requested count (most recent ticks)
+    if len(all_ticks) > count:
+        all_ticks = all_ticks[-count:]
+
+    return all_ticks
 
 
 async def buy_contract(client, symbol, direction, duration, duration_unit, stake):
@@ -2561,13 +2595,15 @@ async def main():
     for s in hz_symbols:
         symbol_data[s] = SymbolData(s, tick_dt=1.0)   # 1HZ ticks every 1s
 
-    print("Bootstrapping tick history for all symbols (this funds the deep startup calibration)...")
+    print(f"Bootstrapping tick history for all symbols (target: {HISTORY_BOOTSTRAP_COUNT} ticks each)...")
     for s in symbols:
         history = await fetch_history(client, s)
         for epoch, price in history:
             symbol_data[s].add_tick(epoch, price)
         actual_dt = symbol_data[s].mean_tick_dt()
-        print(f"  {s}: {len(symbol_data[s].ticks)} ticks loaded  actual_mean_dt={actual_dt:.2f}s")
+        n = len(symbol_data[s].ticks)
+        span_hrs = (n * actual_dt) / 3600
+        print(f"  {s}: {n} ticks loaded  actual_mean_dt={actual_dt:.2f}s  span≈{span_hrs:.1f}h")
 
     tick_queue = client.subscribe_channel("tick")
     balance_queue = client.subscribe_channel("balance")
