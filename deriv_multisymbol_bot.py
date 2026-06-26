@@ -116,7 +116,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
-DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "real").strip().lower()
+DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
 DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
 
 # ── Supabase persistence (Railway has no persistent filesystem) ──
@@ -131,8 +131,8 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.99
-MARTINGALE_MAX_STEPS = 10               # up to 3 recovery steps after the initial stake
+MARTINGALE_FACTOR = 1.24
+MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
@@ -150,8 +150,8 @@ MIN_SCORE_GAP = 0.05
 # 12/16 layers must agree (75% supermajority). No more than 3 allowed to
 # actively oppose. This eliminates all the 9-agree / 5-disagree borderline
 # entries that the logs showed were the source of losses.
-MIN_LAYER_AGREE    = 11                # minimum layers voting FOR direction (75% of 16)
-MAX_LAYER_DISAGREE = 1                 # maximum layers allowed to vote AGAINST
+MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
+MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
 # Raised from 0.45 → 0.52: the best simulated duration must show a meaningful
@@ -167,31 +167,8 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # After ANY loss, trigger a full deep recalibration across all symbols before
 # the next entry. No rate limiter — every loss gets a fresh recal.
 POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
-CANDIDATE_DURATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # ticks — Deriv only accepts 1-10 tick contracts
+CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks — Deriv only accepts 1-10 tick contracts
 MC_SIMULATIONS = 50000
-
-# ── ENDSIN (EXPIRYRANGE) barrier contract — 1HZ10V only ─────────────────────
-# Wins if price stays INSIDE ±ENDSIN_BARRIER at expiry (2 minutes).
-# Payout $0.11–$0.18 on a $0.35 stake — unfavourable ratio means the MC
-# barrier breach gate must be strict:
-#   At $0.18 payout → break-even breach prob = 34.0%
-#   At $0.11 payout → break-even breach prob = 23.9%
-# We target < ENDSIN_MAX_BREACH_PROB (22%) to give a real edge buffer above
-# the worst-case break-even. Only fired when volatility, trend, and structure
-# conditions all confirm the market is genuinely range-bound.
-ENDSIN_SYMBOL            = "1HZ10V"   # only this symbol runs ENDSIN contracts
-ENDSIN_BARRIER           = 2.3        # ±1.9 from entry price
-ENDSIN_DURATION_SECS     = 120        # 2-minute contract window
-ENDSIN_TICKS_PER_SEC     = 1.0        # 1HZ10V ticks ~every 1s → ~120 ticks/contract
-ENDSIN_STAKE             = 0.35       # fixed stake (Deriv minimum)
-ENDSIN_PAYOUT_MIN        = 0.11       # worst-case net payout
-ENDSIN_PAYOUT_MAX        = 0.18       # best-case net payout
-ENDSIN_MAX_BREACH_PROB   = 0.55       # MC must show < 22% breach probability
-ENDSIN_MC_SIMS           = 50000        # simulations per barrier breach estimate
-ENDSIN_MAX_ADX           = 22         # ADX above this → market trending → skip
-ENDSIN_MAX_GARCH_VOL_RATIO = 0.85    # GARCH cond_vol / baseline_vol must be below this
-ENDSIN_MIN_BOLL_WIDTH_PCT  = 0.0      # placeholder — no minimum (tight bands preferred)
-ENDSIN_COOLDOWN_SECS     = 150        # minimum seconds between ENDSIN trades
 
 WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
                                         # before the bot force-restarts itself in place
@@ -387,11 +364,6 @@ class TradeState:
         self.seq_p_up      = 0.5
         self.seq_confidence= 0.0
         self.seq_duration  = 0
-
-        # ENDSIN barrier contract tracking
-        self.last_endsin_time  = 0.0    # epoch of last ENDSIN trade (cooldown gate)
-        self.endsin_wins       = 0      # lifetime ENDSIN wins
-        self.endsin_total      = 0      # lifetime ENDSIN attempts
 
 
 @dataclass
@@ -1114,10 +1086,10 @@ def compute_adx(prices, period=14):
     return adx, trend_strength, up_bias
 
 
-def compute_bollinger(prices, period=20, n_std=2.0):
-    """L15: Bollinger Band %B. Confirms OU mean-reversion signals.
-    %B near 0 = price at lower band (oversold), near 1 = upper band (overbought).
-    Signal: positive = expect up (below mid), negative = expect down (above mid)."""
+def compute_bollinger(prices, period=20, n_std=2.0, momentum_mode=False):
+    """L15: Bollinger Band %B. Regime-aware polarity.
+    momentum_mode=False (ranging)  — mean-reversion: upper band → -signal (expect down)
+    momentum_mode=True  (trending) — momentum: upper band → +signal (trend continues up)"""
     if len(prices) < period + 2:
         return 0.5, 0.0
     window = prices[-period:]
@@ -1125,24 +1097,30 @@ def compute_bollinger(prices, period=20, n_std=2.0):
     std    = np.std(window)
     if std == 0:
         return 0.5, 0.0
-    upper   = mid + n_std * std
-    lower   = mid - n_std * std
-    pct_b   = (prices[-1] - lower) / (upper - lower + 1e-9)
-    pct_b   = float(np.clip(pct_b, -0.5, 1.5))
-    signal  = float(np.clip((0.5 - pct_b) * 2, -1, 1))   # +1 at lower band, -1 at upper
+    upper  = mid + n_std * std
+    lower  = mid - n_std * std
+    pct_b  = float(np.clip((prices[-1] - lower) / (upper - lower + 1e-9), -0.5, 1.5))
+    if momentum_mode:
+        signal = float(np.clip((pct_b - 0.5) * 2, -1, 1))   # follow: +1 at upper, -1 at lower
+    else:
+        signal = float(np.clip((0.5 - pct_b) * 2, -1, 1))   # fade:   +1 at lower, -1 at upper
     return pct_b, signal
 
 
-def compute_zscore(prices, period=50):
-    """L16: Z-score of current price vs rolling mean. Confirms or contradicts
-    OU reversion direction. Strong signal when Z > 2 or < -2."""
+def compute_zscore(prices, period=50, momentum_mode=False):
+    """L16: Z-score of price vs rolling mean. Regime-aware polarity.
+    momentum_mode=False (ranging)  — fade the move: high z → -signal (expect reversion)
+    momentum_mode=True  (trending) — follow the move: high z → +signal (trend continues)"""
     if len(prices) < period + 2:
         return 0.0, 0.0
     window = prices[-period:]
     mu     = np.mean(window)
     sigma  = np.std(window) if np.std(window) > 0 else 1e-9
     z      = (prices[-1] - mu) / sigma
-    signal = float(np.clip(-z / 2, -1, 1))   # negative z = below mean = expect up
+    if momentum_mode:
+        signal = float(np.clip(z / 2,  -1, 1))   # follow the move
+    else:
+        signal = float(np.clip(-z / 2, -1, 1))   # fade the move
     return float(z), signal
 
 
@@ -1223,372 +1201,6 @@ def detect_jumps(returns, threshold_sigma=2.5):
     # post-jump: last tick was a jump → expect partial reversion
     post_jump = -float(np.sign(z_scores[-1])) if jump_mask[-1] else 0.0
     return intensity, float(jump_dir), float(post_jump)
-
-
-# ---------------------------------------------------------------------------
-# ENDSIN (EXPIRYRANGE) MODULE
-# Three functions: MC barrier breach estimator, volatility gate, and executor.
-# These run independently from the direction trade pipeline — shared inputs
-# (feats, prices, returns) but completely separate signal logic and execution.
-# ---------------------------------------------------------------------------
-
-def monte_carlo_barrier_breach(prices, feats, barrier=1.9,
-                                duration_secs=120, ticks_per_sec=1.0,
-                                n_sims=ENDSIN_MC_SIMS):
-    """Estimate the probability that price breaches ±barrier from entry at ANY
-    tick during the contract window, using Monte Carlo path simulation.
-
-    This is a FIRST-PASSAGE problem, not a terminal-value problem.  Every tick
-    along the simulated path is checked — a breach at tick 3 of 120 counts the
-    same as a breach at tick 119.  This is the correct framing for ENDSIN:
-    the contract pays if price is inside the barriers AT EXPIRY, but Deriv
-    knocks it out the moment either barrier is touched during the window.
-
-    INPUTS
-    ──────
-    prices        : recent tick price array (numpy)
-    feats         : compute_features() output dict — provides GARCH vol, OU drift
-    barrier       : half-width of the range (±1.9 means total corridor of 3.8)
-    duration_secs : contract length in seconds (120 = 2 minutes)
-    ticks_per_sec : tick rate of the symbol (1.0 for 1HZ10V)
-    n_sims        : number of Monte Carlo paths
-
-    SIMULATION MODEL
-    ────────────────
-    Each tick step is drawn from N(drift_per_tick, vol_per_tick).
-    • vol_per_tick: GARCH conditional volatility if available (preferred — it
-      forecasts near-term vol, not historical vol).  Falls back to std(returns).
-    • drift_per_tick: OU mean-reversion pull weighted by (1-trend_weight),
-      same weighting used in the direction MC so the two modules are consistent.
-      For range contracts drift is almost always near-zero (we only fire when
-      the market is ranging) but we carry it honestly rather than assuming zero.
-
-    Path tracking: cumulative sum of steps.  If |cumulative_move| >= barrier
-    at any step → breach.  Count of breaching paths / n_sims = breach_prob.
-
-    RETURNS
-    ───────
-    breach_prob   : float in [0, 1]
-    detail        : dict with vol_per_tick, drift_per_tick, n_steps, n_sims
-    """
-    returns = np.diff(prices) if len(prices) > 1 else np.array([0.0])
-    if len(returns) < 10:
-        return 1.0, {"reason": "insufficient_returns"}
-
-    n_steps = max(1, int(round(duration_secs * ticks_per_sec)))
-
-    # ── Volatility per tick (in raw price-unit space) ────────────────────────
-    # The barrier is in price units (e.g. ±1.9 on a price of ~9868).
-    # The simulation must use price-unit moves per tick, NOT return-space vol.
-    #
-    # cond_vol from feats is GARCH vol in return space (very small: ~0.00002).
-    # To convert to price-unit space: price_vol = cond_vol * current_price.
-    # Baseline fallback: std of raw price differences (already in price units).
-    current_price = float(prices[-1]) if len(prices) > 0 else 1.0
-    cond_vol      = feats.get("cond_vol")
-
-    raw_diffs    = np.diff(prices[-100:]) if len(prices) >= 101 else np.diff(prices)
-    baseline_vol = float(np.std(raw_diffs)) if len(raw_diffs) > 1 else 1e-4
-    if baseline_vol <= 0:
-        baseline_vol = 1e-4
-
-    if cond_vol and cond_vol > 0 and current_price > 0:
-        # Convert return-space → price-space
-        price_vol_per_tick = float(cond_vol) * current_price
-        # Safety clamp: cap at 5× empirical, floor at 0.1× empirical
-        # Guards against GARCH artefacts producing absurd values.
-        price_vol_per_tick = float(np.clip(price_vol_per_tick,
-                                           baseline_vol * 0.1,
-                                           baseline_vol * 5.0))
-        used_garch = True
-    else:
-        price_vol_per_tick = baseline_vol
-        used_garch = False
-
-    vol_per_tick = price_vol_per_tick
-
-    # ── Drift per tick (OU mean-reversion pull) ──────────────────────────────
-    ou_params    = feats.get("ou_params")
-    trend_weight = feats.get("trend_weight", 0.5)
-    current_price = float(prices[-1])
-    drift_per_tick = 0.0
-    if ou_params and ou_params.get("theta", 0) > 0:
-        raw_pull = ou_params["theta"] * (ou_params["mu"] - current_price) * 0.01
-        drift_per_tick = float(raw_pull) * (1.0 - trend_weight)
-
-    # ── Simulate N paths of n_steps ticks each ───────────────────────────────
-    # shape: (n_sims, n_steps)
-    steps = np.random.normal(
-        loc   = drift_per_tick,
-        scale = vol_per_tick,
-        size  = (n_sims, n_steps)
-    )
-    # cumulative price move from entry at each tick along every path
-    cumulative = np.cumsum(steps, axis=1)            # shape (n_sims, n_steps)
-
-    # Breach = absolute cumulative move >= barrier at ANY tick
-    breached      = np.any(np.abs(cumulative) >= barrier, axis=1)
-    breach_prob   = float(np.mean(breached))
-
-    detail = {
-        "breach_prob":      breach_prob,
-        "vol_per_tick":     vol_per_tick,
-        "drift_per_tick":   drift_per_tick,
-        "n_steps":          n_steps,
-        "n_sims":           n_sims,
-        "barrier":          barrier,
-        "baseline_vol":     baseline_vol,
-        "current_price":    current_price,
-        "used_garch_vol":   used_garch,
-    }
-    return breach_prob, detail
-
-
-def endsin_volatility_gate(feats, prices):
-    """Secondary signal gate for ENDSIN contracts — inverted from the direction
-    gate.  We want LOW volatility, LOW trend strength, and NO structural break.
-
-    All sub-conditions must pass simultaneously.  Returns (passes, reason_dict)
-    so the caller can log exactly which condition blocked the trade.
-
-    CONDITIONS (all required):
-    ──────────────────────────
-    1. ADX below ENDSIN_MAX_ADX          — market must not be trending
-    2. GARCH vol ratio below threshold   — forward vol must be subdued relative
-                                           to historical vol (not expanding)
-    3. MBS signal is neutral (0.0) or    — no active structural break in progress
-       weakly aligned (|mbs| < 0.4)       (BOS / CHoCH would signal vol expansion)
-    4. Bollinger Band width is below     — price is compressed, not stretched
-       the rolling median width           (computed from recent prices directly)
-    5. Hawkes intensity is low           — no momentum clustering in recent ticks
-    """
-    reasons = {}
-    passes  = True
-
-    # ── 1. ADX trend strength ────────────────────────────────────────────────
-    adx_trend = feats.get("adx_trend", 1.0)   # 0=ranging, 1=strong trend
-    # adx_dir * adx_trend is the directional signal; adx_trend alone is strength
-    # We scale it: if ADX is strong (adx_trend > 0.5) it's likely above threshold
-    adx_raw = adx_trend * 50  # approximate raw ADX (adx_trend normalised to [0,1])
-    if adx_raw > ENDSIN_MAX_ADX:
-        passes = False
-        reasons["adx"] = f"ADX≈{adx_raw:.1f} > {ENDSIN_MAX_ADX} (trending)"
-
-    # ── 2. GARCH conditional volatility ratio ────────────────────────────────
-    vol_trust  = feats.get("vol_trust", 0.5)
-    # vol_trust = 1/(1 + max(ratio-1,0)*2) — invert to get approximate ratio
-    # vol_trust < 0.5 means ratio > 1.5 (vol expanding) — definitely skip
-    # vol_trust >= ENDSIN_MAX_GARCH_VOL_RATIO threshold in trust space:
-    #   trust >= 0.85 means ratio <= ~1.09 (vol barely above baseline) — OK
-    if vol_trust < ENDSIN_MAX_GARCH_VOL_RATIO:
-        passes = False
-        reasons["vol_trust"] = (f"vol_trust={vol_trust:.3f} < "
-                                f"{ENDSIN_MAX_GARCH_VOL_RATIO} (vol expanding)")
-
-    # ── 3. MBS structure — no active break ───────────────────────────────────
-    mbs = abs(feats.get("mbs_signal", 0.0))
-    if mbs >= 0.4:
-        passes = False
-        reasons["mbs"] = f"|mbs_signal|={mbs:.2f} >= 0.4 (structural break active)"
-
-    # ── 4. Bollinger Band width — price must be compressed ───────────────────
-    # Use recent prices to compute a rolling std as a proxy for band width.
-    # If current std > median rolling std → bands are widening → skip.
-    if len(prices) >= 40:
-        recent_std  = float(np.std(prices[-10:]))
-        rolling_std = float(np.median([np.std(prices[i:i+10])
-                                       for i in range(0, len(prices)-10, 5)]))
-        if rolling_std > 0 and recent_std > rolling_std * 1.20:
-            passes = False
-            reasons["boll_width"] = (f"recent_std={recent_std:.4f} > "
-                                     f"rolling_median*1.2={rolling_std*1.2:.4f} "
-                                     f"(bands widening)")
-
-    # ── 5. Hawkes intensity — no momentum clustering ──────────────────────────
-    hawkes = abs(feats.get("hawkes", 0.0))
-    if hawkes > 0.5:
-        passes = False
-        reasons["hawkes"] = f"|hawkes|={hawkes:.3f} > 0.5 (momentum clustering)"
-
-    return passes, reasons
-
-
-async def execute_endsin_trade(client, state, symbol_data, feats):
-    """Evaluate and optionally place one ENDSIN (EXPIRYRANGE) contract on
-    1HZ10V.  Called from the main loop on every iteration when:
-      • No direction trade is in progress
-      • The symbol 1HZ10V is in the ready set and calibrated
-      • The ENDSIN cooldown has elapsed
-
-    Decision flow:
-      1. Volatility gate (endsin_volatility_gate)   — blocks trending / volatile markets
-      2. MC barrier breach estimate                  — blocks if breach_prob >= threshold
-      3. EV sanity check                             — blocks if expected value is negative
-      4. Execute buy if all pass
-      5. Log outcome with full detail
-
-    Returns True if a trade was placed (win or loss), False if blocked by any gate.
-    """
-    ENDSIN_SYM = ENDSIN_SYMBOL
-    if ENDSIN_SYM not in state.model_cache:
-        return False
-
-    sd      = symbol_data.get(ENDSIN_SYM)
-    if sd is None or len(sd.ticks) < MIN_TICKS_LIVE:
-        return False
-
-    prices  = sd.prices()
-    returns = sd.returns()
-
-    # ── Cooldown gate ────────────────────────────────────────────────────────
-    elapsed_since_last = time.time() - state.last_endsin_time
-    if elapsed_since_last < ENDSIN_COOLDOWN_SECS:
-        return False
-
-    # ── Volatility / structure gate ──────────────────────────────────────────
-    gate_ok, gate_reasons = endsin_volatility_gate(feats, prices)
-    if not gate_ok:
-        print(f"[ENDSIN] Gate blocked: {gate_reasons}")
-        return False
-
-    # ── MC barrier breach probability ────────────────────────────────────────
-    breach_prob, breach_detail = monte_carlo_barrier_breach(
-        prices, feats,
-        barrier       = ENDSIN_BARRIER,
-        duration_secs = ENDSIN_DURATION_SECS,
-        ticks_per_sec = ENDSIN_TICKS_PER_SEC,
-        n_sims        = ENDSIN_MC_SIMS,
-    )
-    if breach_prob >= ENDSIN_MAX_BREACH_PROB:
-        print(f"[ENDSIN] MC blocked: breach_prob={breach_prob:.3f} >= "
-              f"{ENDSIN_MAX_BREACH_PROB} "
-              f"(vol={breach_detail['vol_per_tick']:.5f} "
-              f"steps={breach_detail['n_steps']})")
-        return False
-
-    # ── Vol sanity guard ─────────────────────────────────────────────────────
-    # If vol_per_tick is implausibly small (< 0.001 price units on a ~9868 price
-    # instrument), the GARCH unit conversion may have silently failed.  A vol
-    # this tiny means the MC will always show breach_prob ≈ 0 regardless of
-    # market conditions — blocking this prevents phantom "0.000" breach reads.
-    if breach_detail["vol_per_tick"] < 0.001:
-        print(f"[ENDSIN] Vol sanity blocked: vol_per_tick={breach_detail['vol_per_tick']:.6f} "
-              f"< 0.001 (implausibly small — GARCH unit conversion suspect, skipping)")
-        return False
-
-    # ── Expected value sanity check ──────────────────────────────────────────
-    # EV = (1-breach_prob)*payout_min - breach_prob*stake
-    # Using payout_min for conservative estimate
-    ev_conservative = ((1.0 - breach_prob) * ENDSIN_PAYOUT_MIN
-                       - breach_prob * ENDSIN_STAKE)
-    if ev_conservative <= 0:
-        print(f"[ENDSIN] EV blocked: EV={ev_conservative:.4f} <= 0 "
-              f"(breach_prob={breach_prob:.3f} too high for min payout)")
-        return False
-
-    ev_optimistic = ((1.0 - breach_prob) * ENDSIN_PAYOUT_MAX
-                     - breach_prob * ENDSIN_STAKE)
-
-    # ── Place the contract ───────────────────────────────────────────────────
-    entry_price = float(prices[-1])
-    upper_barrier = round(entry_price + ENDSIN_BARRIER, 5)
-    lower_barrier = round(entry_price - ENDSIN_BARRIER, 5)
-
-    ts = datetime.utcnow().isoformat()
-    sep = "─" * 60
-    print(f"\n{sep}")
-    print(f"  ENDSIN TRADE  {ts}")
-    print(sep)
-    print(f"  Symbol    : {ENDSIN_SYM}")
-    print(f"  Entry     : {entry_price:.5f}")
-    print(f"  Barriers  : [{lower_barrier:.5f}, {upper_barrier:.5f}]  (±{ENDSIN_BARRIER})")
-    print(f"  Duration  : {ENDSIN_DURATION_SECS}s (~{breach_detail['n_steps']} ticks)")
-    print(f"  Stake     : ${ENDSIN_STAKE:.2f}")
-    print(f"  MC breach : {breach_prob:.3f}  ({ENDSIN_MC_SIMS} sims, "
-          f"{'GARCH vol' if breach_detail['used_garch_vol'] else 'baseline vol'} "
-          f"= {breach_detail['vol_per_tick']:.5f}/tick)")
-    print(f"  EV range  : [{ev_conservative:+.4f}, {ev_optimistic:+.4f}]  "
-          f"(conservative / optimistic)")
-    print(f"  Gate      : ADX✓  vol_trust✓  MBS-neutral✓  Bollinger✓  Hawkes✓")
-    print(sep)
-
-    won, profit = False, 0.0
-    contract_id = None
-    try:
-        req = {
-            "buy": "1",
-            "price": ENDSIN_STAKE,
-            "parameters": {
-                "amount":              ENDSIN_STAKE,
-                "basis":               "stake",
-                "contract_type":       "EXPIRYRANGE",
-                "currency":            "USD",
-                "duration":            ENDSIN_DURATION_SECS,
-                "duration_unit":       "s",
-                "underlying_symbol":   ENDSIN_SYM,
-                "barrier":             str(upper_barrier),
-                "barrier2":            str(lower_barrier),
-            },
-        }
-        resp = await client.send(req, timeout=30)
-        if "error" in resp:
-            print(f"[ENDSIN] Buy failed: {resp['error'].get('message', resp['error'])}")
-            return False
-        contract_id = resp.get("buy", {}).get("contract_id")
-        if not contract_id:
-            print(f"[ENDSIN] No contract_id in buy response: {resp}")
-            return False
-
-        print(f"[ENDSIN] Contract placed — id={contract_id}  "
-              f"waiting {ENDSIN_DURATION_SECS}s for result...")
-
-        # Wait for contract result (poll proposal_open_contract)
-        deadline = time.time() + ENDSIN_DURATION_SECS + 15  # 15s grace
-        while time.time() < deadline:
-            await asyncio.sleep(5)
-            try:
-                poll = await client.send({
-                    "proposal_open_contract": 1,
-                    "contract_id": contract_id,
-                })
-                poc = poll.get("proposal_open_contract", {})
-                status = poc.get("status")
-                if status == "sold" or poc.get("is_expired") or poc.get("is_settleable"):
-                    profit = float(poc.get("profit", 0.0))
-                    won    = profit > 0
-                    break
-            except Exception:
-                pass
-
-    except Exception as e:
-        print(f"[ENDSIN] Execution error: {e}")
-        return False
-
-    # ── Update state and log ─────────────────────────────────────────────────
-    state.last_endsin_time = time.time()
-    state.endsin_total    += 1
-    if won:
-        state.endsin_wins += 1
-
-    wr = state.endsin_wins / state.endsin_total if state.endsin_total > 0 else 0.0
-    outcome = f"✓ WIN  +${profit:.2f}" if won else f"✗ LOSS  -${ENDSIN_STAKE:.2f}"
-    print(f"\n{sep}")
-    print(f"  ENDSIN RESULT  {datetime.utcnow().isoformat()}")
-    print(sep)
-    print(f"  Contract id : {contract_id}")
-    print(f"  Outcome     : {outcome}")
-    print(f"  Net P/L     : {profit:+.2f}")
-    print(f"  ENDSIN W/L  : {state.endsin_wins}/{state.endsin_total}  "
-          f"({wr:.1%} win rate)")
-    print(sep + "\n")
-
-    try:
-        bal_resp = await client.send({"balance": 1})
-        state.balance = bal_resp["balance"]["balance"]
-    except Exception:
-        pass
-
-    return True
 
 
 def fit_garch(returns, scale=1000.0):
@@ -1767,11 +1379,17 @@ def compute_features(sd, models, returns_window_dict):
     copula     = copula_agreement(sd.symbol, returns_window_dict)
 
     # ── Confirmation layers (L13-L18) ───────────────────────────────────────
-    _,    rsi_signal   = compute_rsi(prices)
-    _,    srsi_signal  = compute_stoch_rsi(prices)
+    # Regime classification: combine HMM trend_weight + Hurst exponent.
+    # Both must agree that the market is trending before momentum mode activates.
+    #   momentum_mode=True  → RSI/StochRSI/Boll/Z-score FOLLOW the direction
+    #   momentum_mode=False → classic mean-reversion: fade overbought/oversold
+    momentum_mode = bool(trend_weight > 0.60 and h > 0.52)
+
+    _,    rsi_signal   = compute_rsi(prices, momentum_mode=momentum_mode)
+    _,    srsi_signal  = compute_stoch_rsi(prices, momentum_mode=momentum_mode)
     adx_val, adx_trend, adx_dir = compute_adx(prices)
-    _,    boll_signal  = compute_bollinger(prices)
-    z_val, z_signal    = compute_zscore(prices)
+    _,    boll_signal  = compute_bollinger(prices, momentum_mode=momentum_mode)
+    z_val, z_signal    = compute_zscore(prices, momentum_mode=momentum_mode)
 
     # transfer entropy: average signal from all OTHER symbols toward this one
     te_signal = 0.0
@@ -1834,15 +1452,16 @@ def compute_features(sd, models, returns_window_dict):
         "cond_vol":     cond_vol,
         "ou_params":    models.ou_params,
         # confirmation layers
-        "rsi_signal":   rsi_signal,
-        "srsi_signal":  srsi_signal,
-        "adx_val":      adx_val,
-        "adx_trend":    adx_trend,
-        "adx_dir":      adx_dir,
-        "boll_signal":  boll_signal,
-        "z_signal":     z_signal,
-        "z_val":        z_val,
-        "te_signal":    te_signal,
+        "rsi_signal":    rsi_signal,
+        "srsi_signal":   srsi_signal,
+        "adx_val":       adx_val,
+        "adx_trend":     adx_trend,
+        "adx_dir":       adx_dir,
+        "boll_signal":   boll_signal,
+        "z_signal":      z_signal,
+        "z_val":         z_val,
+        "te_signal":     te_signal,
+        "momentum_mode": momentum_mode,   # logged to trade journal for analysis
         "jump_intensity": jump_intensity,
         "jump_dir":     jump_dir,
         "post_jump":    post_jump,
@@ -1898,22 +1517,24 @@ def bayesian_fusion(features):
     ]
 
     # ── Confirmation layers (incremental, lower base weight) ────────────────
-    adx_trust = features["adx_trend"]   # 0 = ranging, 1 = strongly trending
-    # RSI/StochRSI agree on direction: boost weight; disagree: reduce
-    rsi_agree = 1.0 if (features["rsi_signal"] * features["srsi_signal"]) >= 0 else 0.4
-    # Bollinger and Z-score both measure price stretch — agree: boost
-    bz_agree  = 1.0 if (features["boll_signal"] * features["z_signal"]) >= 0 else 0.4
+    adx_trust     = features["adx_trend"]
+    momentum_mode = features.get("momentum_mode", False)
+    # When both RSI + StochRSI agree → boost; when they disagree → reduce
+    rsi_agree  = 1.0 if (features["rsi_signal"] * features["srsi_signal"]) >= 0 else 0.4
+    bz_agree   = 1.0 if (features["boll_signal"] * features["z_signal"])   >= 0 else 0.4
+    # Regime confidence: how decisively HMM+Hurst agree on the regime
+    regime_conf = float(np.clip(abs(trend_w - 0.5) * 2 + abs(hurst_w - 0.5) * 2, 0, 1))
 
     evidence += [
-        (features["rsi_signal"],                               W("rsi",      0.35) * rsi_agree),
-        (features["srsi_signal"],                              W("srsi",     0.30) * rsi_agree),
-        (features["adx_dir"]     * adx_trust,                 W("adx",      0.35)),
-        (features["boll_signal"]                             , W("boll",     0.30) * bz_agree),
-        (features["z_signal"],                                 W("zscore",   0.30) * bz_agree),
-        (features["te_signal"],                                W("te",       0.30)),
-        # Jump: during jump use jump_dir, post-jump use reversion signal
-        (features["jump_dir"]    * features["jump_intensity"], W("jump",     0.25)),
-        (features["post_jump"]   * features["jump_intensity"], W("post_jump",0.20)),
+        (features["rsi_signal"],                                W("rsi",      0.35) * rsi_agree * (1 + regime_conf * 0.5)),
+        (features["srsi_signal"],                               W("srsi",     0.30) * rsi_agree * (1 + regime_conf * 0.5)),
+        # ADX now produces real signal after tick-data TR fix; scale by trend strength
+        (features["adx_dir"] * adx_trust,                      W("adx",      0.40) * (0.5 + adx_trust)),
+        (features["boll_signal"],                               W("boll",     0.30) * bz_agree * (1 + regime_conf * 0.4)),
+        (features["z_signal"],                                  W("zscore",   0.30) * bz_agree * (1 + regime_conf * 0.4)),
+        (features["te_signal"],                                 W("te",       0.30)),
+        (features["jump_dir"]    * features["jump_intensity"],  W("jump",     0.25)),
+        (features["post_jump"]   * features["jump_intensity"],  W("post_jump",0.20)),
     ]
 
     total_trust = features["vol_trust"] * features["entropy_trust"]
@@ -1926,6 +1547,87 @@ def bayesian_fusion(features):
     p_up       = float(np.clip(1.0 / (1.0 + math.exp(-log_odds)), 0.01, 0.99))
     confidence = abs(p_up - 0.5) * 2.0 * total_trust
     return p_up, confidence
+
+
+# ---------------------------------------------------------------------------
+# SELF-IMPROVEMENT: ONLINE LAYER WEIGHT UPDATE
+# Nudges each layer's fusion weight ±4% after every step-0 trade outcome.
+# Runs between calibrations so the bot adapts continuously from live results.
+#
+# Rule: won+agreed → reward (↑), won+opposed → punish (↓),
+#       lost+agreed → punish (↓), lost+opposed → reward (↑)
+# ---------------------------------------------------------------------------
+def online_update_layer_weights(models: SymbolModels, feats: dict,
+                                direction: int, won: bool, lr: float = 0.04):
+    if models is None or feats is None:
+        return
+    layer_signals = {
+        "markov":    (feats.get("markov_p",     0.5) - 0.5) * 2,
+        "hmm":        feats.get("hmm_lean",      0),
+        "hawkes":     feats.get("hawkes",         0),
+        "ou":         feats.get("ou_dir",         0) * feats.get("ou_strength", 0),
+        "hurst":      feats.get("hurst_signal",   0),
+        "arfima":     feats.get("arfima_bias",    0),
+        "kalman":     feats.get("kalman",         0),
+        "copula":    (feats.get("copula_agree",  0.5) - 0.5) * 2,
+        "rsi":        feats.get("rsi_signal",     0),
+        "srsi":       feats.get("srsi_signal",    0),
+        "adx":        feats.get("adx_dir",        0) * feats.get("adx_trend", 0),
+        "boll":       feats.get("boll_signal",    0),
+        "zscore":     feats.get("z_signal",       0),
+        "te":         feats.get("te_signal",      0),
+        "jump":       feats.get("jump_dir",       0) * feats.get("jump_intensity", 0),
+        "post_jump":  feats.get("post_jump",      0) * feats.get("jump_intensity", 0),
+    }
+    w       = dict(models.per_layer_weights or {})
+    outcome = 1 if won else -1
+    for layer, signal in layer_signals.items():
+        if abs(signal) < 0.01:
+            continue
+        agreement = 1 if signal * direction > 0 else -1
+        reward    = outcome * agreement
+        current_w = w.get(layer, 1.0)
+        w[layer]  = float(np.clip(current_w + lr * reward * abs(current_w), 0.05, 3.0))
+    models.per_layer_weights = w
+
+
+# ---------------------------------------------------------------------------
+# SELF-IMPROVEMENT: AUTO-TUNE ENTRY GATES
+# Adjusts MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE from the
+# rolling step-0 win rate. Called every 50 step-0 trades and post-calibration.
+# Gate changes are persisted to Supabase so Railway restarts inherit them.
+# ---------------------------------------------------------------------------
+def autotune_gates(state):
+    global MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
+    total_wins   = sum(state.step0_wins.values())
+    total_trades = sum(state.step0_total.values())
+    if total_trades < 50:
+        return
+    wr = total_wins / total_trades
+    changed = False
+    if wr < 0.46:
+        new_agree = min(MIN_LAYER_AGREE + 1, 14)
+        new_dis   = max(MAX_LAYER_DISAGREE - 1, 1)
+        new_mc    = min(MIN_EXP_WIN_RATE + 0.01, 0.58)
+        if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
+            MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
+            changed = True
+            print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades < 0.46 → TIGHTENED: "
+                  f"agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
+    elif wr > 0.54 and total_trades >= 100:
+        new_agree = max(MIN_LAYER_AGREE - 1, 10)
+        new_dis   = min(MAX_LAYER_DISAGREE + 1, 4)
+        new_mc    = max(MIN_EXP_WIN_RATE - 0.01, 0.50)
+        if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
+            MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
+            changed = True
+            print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades > 0.54 → RELAXED: "
+                  f"agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
+    else:
+        print(f"[AutoTune] WR={wr:.3f} over {total_trades} trades — gates unchanged.")
+    if changed and _store:
+        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
 
 
 # ---------------------------------------------------------------------------
@@ -2136,6 +1838,11 @@ def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win
     entropy_state= ("HIGH — low structure"  if feats["entropy_trust"] < 0.4
                     else "MODERATE" if feats["entropy_trust"] < 0.65
                     else "low — market is structured")
+    conf_mode    = ("MOMENTUM (RSI/StochRSI/Boll/Z-score follow trend)"
+                    if feats.get("momentum_mode") else
+                    "MEAN-REVERSION (RSI/StochRSI/Boll/Z-score fade extremes)")
+    adx_str      = (f"ADX={feats['adx_val']:.1f}  trend_str={feats['adx_trend']:.2f}"
+                    f"  dir={feats['adx_dir']:+.0f}")
 
     print(f"\n{sep}")
     print(f"  TRADE SIGNAL  {ts}")
@@ -2148,8 +1855,10 @@ def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win
     print("\n  Market regime:")
     print(f"    Hurst H={feats['hurst']:.3f}  → {hurst_regime}")
     print(f"    HMM trend_weight={feats['trend_weight']:.2f}  → {hmm_regime}")
-    print(f"    Volatility state → {vol_state}")
-    print(f"    Entropy state    → {entropy_state}")
+    print(f"    Confirmation mode → {conf_mode}")
+    print(f"    {adx_str}")
+    print(f"    Volatility state  → {vol_state}")
+    print(f"    Entropy state     → {entropy_state}")
     print(f"\n  Layer breakdown  [{agree} agree | {disagree} disagree | {neutral} neutral]")
     print(f"  {'Layer':<20}  {'Signal':>7}  {'Direction bar (±1)':^22}")
     print(f"  {'-'*20}  {'-'*7}  {'-'*22}")
@@ -2218,15 +1927,10 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
 
     state.trade_in_progress = True
     won, profit = False, 0.0
-    p_up_val       = feats.get("bayesian_p_up", 0.5) if feats else 0.5
-    confidence_val = feats.get("bayesian_conf", 0.0) if feats else 0.0
     try:
         contract_id = await buy_contract(client, symbol, direction, int(duration), "t", stake)
         won, profit = await wait_for_contract_result(client, contract_id)
         log_trade(symbol, direction, stake, won, profit, step)
-        if _store is not None:
-            _store.save_trade(symbol, direction, step, stake, won, profit,
-                              p_up_val, confidence_val, duration, feats)
     except Exception as e:
         print(f"[Trade] Error on {symbol} step={step}: {e}")
 
@@ -2239,6 +1943,24 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
         state.step0_total[symbol] += 1
         if won:
             state.step0_wins[symbol] += 1
+
+        # ── Online layer weight update ──────────────────────────────────────
+        if feats is not None:
+            models_ref = state.model_cache.get(symbol)
+            if models_ref is not None:
+                online_update_layer_weights(models_ref, feats, direction, won)
+
+        # ── Persist trade to Supabase ───────────────────────────────────────
+        if _store is not None and feats is not None:
+            _store.save_trade(symbol, direction, step, stake, won, profit,
+                              state.seq_p_up, state.seq_confidence,
+                              state.seq_duration, feats)
+
+        # ── Auto-tune gates every 50 step-0 trades ─────────────────────────
+        state._trades_since_autotune += 1
+        if state._trades_since_autotune >= 50:
+            autotune_gates(state)
+            state._trades_since_autotune = 0
 
     try:
         bal_resp = await client.send({"balance": 1})
@@ -2574,6 +2296,21 @@ async def deep_startup_calibration(state, symbol_data, symbols):
 
             state.model_cache[s] = m
 
+            # ── Warm-start: blend Supabase-persisted weights ───────────────
+            pending = state._pending_weights.get(s)
+            if pending:
+                if m.per_layer_weights is None:
+                    m.per_layer_weights = pending
+                    print(f"  Warm weights      : restored from Supabase (no OOS weights this run)")
+                else:
+                    all_keys = set(m.per_layer_weights) | set(pending)
+                    m.per_layer_weights = {
+                        k: round(0.7 * m.per_layer_weights.get(k, 1.0)
+                                 + 0.3 * pending.get(k, 1.0), 6)
+                        for k in all_keys
+                    }
+                    print(f"  Warm weights      : blended OOS 70% + Supabase prior 30%")
+
         state.reliability[s] = float(np.clip(report["mean_hit_rate"] / 0.5, 0.3, 1.5))
         symbol_reports[s]    = report
 
@@ -2626,10 +2363,12 @@ async def deep_startup_calibration(state, symbol_data, symbols):
     state.last_activity              = time.time()
     state.trading_locked             = False
 
+    # ── Persist learned state to Supabase ─────────────────────────────────
     if _store is not None:
         _store.save_symbol_state(state)
         _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
                           MIN_EXP_WIN_RATE, state.adaptive_threshold)
+    autotune_gates(state)
 
 
 
@@ -2655,6 +2394,18 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
             continue
         hit_rate, models, confidences = walk_forward_validate(sd)
         if models is not None:
+            # Blend in Supabase-persisted weights as warm-start
+            pending = state._pending_weights.get(s)
+            if pending:
+                if models.per_layer_weights is None:
+                    models.per_layer_weights = pending
+                else:
+                    all_keys = set(models.per_layer_weights) | set(pending)
+                    models.per_layer_weights = {
+                        k: round(0.7 * models.per_layer_weights.get(k, 1.0)
+                                 + 0.3 * pending.get(k, 1.0), 6)
+                        for k in all_keys
+                    }
             state.model_cache[s] = models
         state.reliability[s] = float(np.clip(hit_rate / 0.5, 0.3, 1.5))
         state.consecutive_losses[s] = 0
@@ -2684,10 +2435,12 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
     print(f"[Calibrator] complete in {state.last_calibration_end - start:.1f}s. Updated: {candidates}")
     state.trading_locked = False
 
+    # ── Persist learned state to Supabase ─────────────────────────────────
     if _store is not None:
         _store.save_symbol_state(state)
         _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
                           MIN_EXP_WIN_RATE, state.adaptive_threshold)
+    autotune_gates(state)
 
 
 # ---------------------------------------------------------------------------
@@ -2749,10 +2502,6 @@ async def main():
         print("! Set DERIV_ACCOUNT_TYPE=demo (or unset it) to use a demo account.  !")
         print("!" * 72)
 
-    # ── Supabase store — instantiate and warm-start before anything else ────
-    global _store
-    _store = SupabaseStore()
-
     client = DerivClient(
         DERIV_APP_ID, DERIV_API_TOKEN,
         account_type=DERIV_ACCOUNT_TYPE, account_id=DERIV_ACCOUNT_ID,
@@ -2764,14 +2513,19 @@ async def main():
     state.balance = account.get("balance", 0.0)
     print(f"Starting balance: {state.balance}")
 
-    # Warm-start: reload reliability scores, per-symbol thresholds, step0
-    # win/loss counts, and per-layer weights from previous session on Supabase.
-    # This means a Railway restart doesn't lose everything learned so far.
+    # ── Supabase: init store and warm-start from persisted state ──────────
+    global _store, MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
+    _store = SupabaseStore()
     _store.load_symbol_state(state)
-
-    # Persist the active gate config so it's visible in Supabase dashboards.
-    _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
-                      MIN_EXP_WIN_RATE, CONFIDENCE_THRESHOLD_DEFAULT)
+    gates = _store.load_gates()
+    if gates:
+        MIN_LAYER_AGREE    = int(gates.get("min_layer_agree",    MIN_LAYER_AGREE))
+        MAX_LAYER_DISAGREE = int(gates.get("max_layer_disagree", MAX_LAYER_DISAGREE))
+        MIN_EXP_WIN_RATE   = float(gates.get("min_exp_win_rate", MIN_EXP_WIN_RATE))
+        state.adaptive_threshold = float(gates.get("adaptive_threshold", state.adaptive_threshold))
+        print(f"[Store] Restored gates: agree>={MIN_LAYER_AGREE} "
+              f"disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f} "
+              f"thr={state.adaptive_threshold:.4f}")
 
     # --- R_ symbols ---
     r_symbols = []
@@ -2874,24 +2628,6 @@ async def main():
             continue
 
         returns_window_dict = {s: symbol_data[s].returns()[-200:] for s in ready_symbols}
-
-        # ── ENDSIN (EXPIRYRANGE) parallel evaluation ──────────────────────────
-        # Runs independently from direction trades.  Fires on 1HZ10V only when:
-        #   • Not in a direction trade or recovery sequence
-        #   • Cooldown since last ENDSIN has elapsed
-        #   • Vol gate and MC breach gate both pass
-        # Does NOT block or delay the direction trade scan below.
-        if (not state.trade_in_progress
-                and state.recovery_step == 0
-                and ENDSIN_SYMBOL in ready_symbols
-                and ENDSIN_SYMBOL in state.model_cache):
-            endsin_feats = compute_features(
-                symbol_data[ENDSIN_SYMBOL],
-                state.model_cache.get(ENDSIN_SYMBOL),
-                returns_window_dict,
-            )
-            if endsin_feats is not None:
-                await execute_endsin_trade(client, state, symbol_data, endsin_feats)
 
         # ── RECOVERY MODE ────────────────────────────────────────────────────
         # No symbol, direction, or duration lock. Recovery is a fresh open scan
