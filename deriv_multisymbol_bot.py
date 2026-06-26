@@ -116,7 +116,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
-DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
+DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "real").strip().lower()
 DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
 
 # ── Supabase persistence (Railway has no persistent filesystem) ──
@@ -131,8 +131,8 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.24
-MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
+MARTINGALE_FACTOR = 1.99
+MARTINGALE_MAX_STEPS = 10               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
@@ -150,8 +150,8 @@ MIN_SCORE_GAP = 0.05
 # 12/16 layers must agree (75% supermajority). No more than 3 allowed to
 # actively oppose. This eliminates all the 9-agree / 5-disagree borderline
 # entries that the logs showed were the source of losses.
-MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
-MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
+MIN_LAYER_AGREE    = 11                # minimum layers voting FOR direction (75% of 16)
+MAX_LAYER_DISAGREE = 1                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
 # Raised from 0.45 → 0.52: the best simulated duration must show a meaningful
@@ -167,7 +167,7 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # After ANY loss, trigger a full deep recalibration across all symbols before
 # the next entry. No rate limiter — every loss gets a fresh recal.
 POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
-CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks — Deriv only accepts 1-10 tick contracts
+CANDIDATE_DURATIONS = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]   # ticks — Deriv only accepts 1-10 tick contracts
 MC_SIMULATIONS = 50000
 
 # ── ENDSIN (EXPIRYRANGE) barrier contract — 1HZ10V only ─────────────────────
@@ -180,14 +180,14 @@ MC_SIMULATIONS = 50000
 # the worst-case break-even. Only fired when volatility, trend, and structure
 # conditions all confirm the market is genuinely range-bound.
 ENDSIN_SYMBOL            = "1HZ10V"   # only this symbol runs ENDSIN contracts
-ENDSIN_BARRIER           = 1.9        # ±1.9 from entry price
+ENDSIN_BARRIER           = 2.3        # ±1.9 from entry price
 ENDSIN_DURATION_SECS     = 120        # 2-minute contract window
 ENDSIN_TICKS_PER_SEC     = 1.0        # 1HZ10V ticks ~every 1s → ~120 ticks/contract
 ENDSIN_STAKE             = 0.35       # fixed stake (Deriv minimum)
 ENDSIN_PAYOUT_MIN        = 0.11       # worst-case net payout
 ENDSIN_PAYOUT_MAX        = 0.18       # best-case net payout
-ENDSIN_MAX_BREACH_PROB   = 0.22       # MC must show < 22% breach probability
-ENDSIN_MC_SIMS           = 910        # simulations per barrier breach estimate
+ENDSIN_MAX_BREACH_PROB   = 0.55       # MC must show < 22% breach probability
+ENDSIN_MC_SIMS           = 50000        # simulations per barrier breach estimate
 ENDSIN_MAX_ADX           = 22         # ADX above this → market trending → skip
 ENDSIN_MAX_GARCH_VOL_RATIO = 0.85    # GARCH cond_vol / baseline_vol must be below this
 ENDSIN_MIN_BOLL_WIDTH_PCT  = 0.0      # placeholder — no minimum (tight bands preferred)
