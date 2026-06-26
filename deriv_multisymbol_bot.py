@@ -116,7 +116,7 @@ warnings.filterwarnings("ignore")
 # ---------------------------------------------------------------------------
 DERIV_APP_ID = os.getenv("DERIV_APP_ID", "")
 DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
-DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "real").strip().lower()
+DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
 DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
 
 # ── Supabase persistence (Railway has no persistent filesystem) ──
@@ -186,12 +186,12 @@ ENDSIN_TICKS_PER_SEC     = 1.0        # 1HZ10V ticks ~every 1s → ~120 ticks/co
 ENDSIN_STAKE             = 0.35       # fixed stake (Deriv minimum)
 ENDSIN_PAYOUT_MIN        = 0.11       # worst-case net payout
 ENDSIN_PAYOUT_MAX        = 0.18       # best-case net payout
-ENDSIN_MAX_BREACH_PROB   = 0.35       # MC must show < 22% breach probability
-ENDSIN_MC_SIMS           = 50000        # simulations per barrier breach estimate
+ENDSIN_MAX_BREACH_PROB   = 0.22       # MC must show < 22% breach probability
+ENDSIN_MC_SIMS           = 910        # simulations per barrier breach estimate
 ENDSIN_MAX_ADX           = 22         # ADX above this → market trending → skip
 ENDSIN_MAX_GARCH_VOL_RATIO = 0.85    # GARCH cond_vol / baseline_vol must be below this
 ENDSIN_MIN_BOLL_WIDTH_PCT  = 0.0      # placeholder — no minimum (tight bands preferred)
-ENDSIN_COOLDOWN_SECS     = 210        # minimum seconds between ENDSIN trades
+ENDSIN_COOLDOWN_SECS     = 150        # minimum seconds between ENDSIN trades
 
 WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
                                         # before the bot force-restarts itself in place
@@ -1277,19 +1277,35 @@ def monte_carlo_barrier_breach(prices, feats, barrier=1.9,
 
     n_steps = max(1, int(round(duration_secs * ticks_per_sec)))
 
-    # ── Volatility per tick ──────────────────────────────────────────────────
-    cond_vol = feats.get("cond_vol")
-    baseline_vol = float(np.std(returns[-100:]) if len(returns) >= 100
-                         else np.std(returns))
-    if baseline_vol <= 0:
-        baseline_vol = 1e-6
+    # ── Volatility per tick (in raw price-unit space) ────────────────────────
+    # The barrier is in price units (e.g. ±1.9 on a price of ~9868).
+    # The simulation must use price-unit moves per tick, NOT return-space vol.
+    #
+    # cond_vol from feats is GARCH vol in return space (very small: ~0.00002).
+    # To convert to price-unit space: price_vol = cond_vol * current_price.
+    # Baseline fallback: std of raw price differences (already in price units).
+    current_price = float(prices[-1]) if len(prices) > 0 else 1.0
+    cond_vol      = feats.get("cond_vol")
 
-    # GARCH conditional vol is forward-looking — prefer it for range contracts
-    # because vol expansion events are exactly what we want to avoid.
-    if cond_vol and cond_vol > 0:
-        vol_per_tick = float(cond_vol)
+    raw_diffs    = np.diff(prices[-100:]) if len(prices) >= 101 else np.diff(prices)
+    baseline_vol = float(np.std(raw_diffs)) if len(raw_diffs) > 1 else 1e-4
+    if baseline_vol <= 0:
+        baseline_vol = 1e-4
+
+    if cond_vol and cond_vol > 0 and current_price > 0:
+        # Convert return-space → price-space
+        price_vol_per_tick = float(cond_vol) * current_price
+        # Safety clamp: cap at 5× empirical, floor at 0.1× empirical
+        # Guards against GARCH artefacts producing absurd values.
+        price_vol_per_tick = float(np.clip(price_vol_per_tick,
+                                           baseline_vol * 0.1,
+                                           baseline_vol * 5.0))
+        used_garch = True
     else:
-        vol_per_tick = baseline_vol
+        price_vol_per_tick = baseline_vol
+        used_garch = False
+
+    vol_per_tick = price_vol_per_tick
 
     # ── Drift per tick (OU mean-reversion pull) ──────────────────────────────
     ou_params    = feats.get("ou_params")
@@ -1315,14 +1331,15 @@ def monte_carlo_barrier_breach(prices, feats, barrier=1.9,
     breach_prob   = float(np.mean(breached))
 
     detail = {
-        "breach_prob":   breach_prob,
-        "vol_per_tick":  vol_per_tick,
-        "drift_per_tick": drift_per_tick,
-        "n_steps":       n_steps,
-        "n_sims":        n_sims,
-        "barrier":       barrier,
-        "baseline_vol":  baseline_vol,
-        "used_garch_vol": bool(cond_vol and cond_vol > 0),
+        "breach_prob":      breach_prob,
+        "vol_per_tick":     vol_per_tick,
+        "drift_per_tick":   drift_per_tick,
+        "n_steps":          n_steps,
+        "n_sims":           n_sims,
+        "barrier":          barrier,
+        "baseline_vol":     baseline_vol,
+        "current_price":    current_price,
+        "used_garch_vol":   used_garch,
     }
     return breach_prob, detail
 
@@ -1447,6 +1464,16 @@ async def execute_endsin_trade(client, state, symbol_data, feats):
               f"{ENDSIN_MAX_BREACH_PROB} "
               f"(vol={breach_detail['vol_per_tick']:.5f} "
               f"steps={breach_detail['n_steps']})")
+        return False
+
+    # ── Vol sanity guard ─────────────────────────────────────────────────────
+    # If vol_per_tick is implausibly small (< 0.001 price units on a ~9868 price
+    # instrument), the GARCH unit conversion may have silently failed.  A vol
+    # this tiny means the MC will always show breach_prob ≈ 0 regardless of
+    # market conditions — blocking this prevents phantom "0.000" breach reads.
+    if breach_detail["vol_per_tick"] < 0.001:
+        print(f"[ENDSIN] Vol sanity blocked: vol_per_tick={breach_detail['vol_per_tick']:.6f} "
+              f"< 0.001 (implausibly small — GARCH unit conversion suspect, skipping)")
         return False
 
     # ── Expected value sanity check ──────────────────────────────────────────
@@ -2191,10 +2218,15 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
 
     state.trade_in_progress = True
     won, profit = False, 0.0
+    p_up_val       = feats.get("bayesian_p_up", 0.5) if feats else 0.5
+    confidence_val = feats.get("bayesian_conf", 0.0) if feats else 0.0
     try:
         contract_id = await buy_contract(client, symbol, direction, int(duration), "t", stake)
         won, profit = await wait_for_contract_result(client, contract_id)
         log_trade(symbol, direction, stake, won, profit, step)
+        if _store is not None:
+            _store.save_trade(symbol, direction, step, stake, won, profit,
+                              p_up_val, confidence_val, duration, feats)
     except Exception as e:
         print(f"[Trade] Error on {symbol} step={step}: {e}")
 
@@ -2594,6 +2626,11 @@ async def deep_startup_calibration(state, symbol_data, symbols):
     state.last_activity              = time.time()
     state.trading_locked             = False
 
+    if _store is not None:
+        _store.save_symbol_state(state)
+        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
+
 
 
 async def run_calibration(state, symbol_data, symbols, trigger_reason):
@@ -2646,6 +2683,11 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
     state.last_activity = time.time()
     print(f"[Calibrator] complete in {state.last_calibration_end - start:.1f}s. Updated: {candidates}")
     state.trading_locked = False
+
+    if _store is not None:
+        _store.save_symbol_state(state)
+        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
 
 
 # ---------------------------------------------------------------------------
@@ -2707,6 +2749,10 @@ async def main():
         print("! Set DERIV_ACCOUNT_TYPE=demo (or unset it) to use a demo account.  !")
         print("!" * 72)
 
+    # ── Supabase store — instantiate and warm-start before anything else ────
+    global _store
+    _store = SupabaseStore()
+
     client = DerivClient(
         DERIV_APP_ID, DERIV_API_TOKEN,
         account_type=DERIV_ACCOUNT_TYPE, account_id=DERIV_ACCOUNT_ID,
@@ -2717,6 +2763,15 @@ async def main():
     state = TradeState()
     state.balance = account.get("balance", 0.0)
     print(f"Starting balance: {state.balance}")
+
+    # Warm-start: reload reliability scores, per-symbol thresholds, step0
+    # win/loss counts, and per-layer weights from previous session on Supabase.
+    # This means a Railway restart doesn't lose everything learned so far.
+    _store.load_symbol_state(state)
+
+    # Persist the active gate config so it's visible in Supabase dashboards.
+    _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
+                      MIN_EXP_WIN_RATE, CONFIDENCE_THRESHOLD_DEFAULT)
 
     # --- R_ symbols ---
     r_symbols = []
