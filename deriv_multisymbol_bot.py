@@ -44,45 +44,6 @@ ENV VARS REQUIRED:
                            your real-money account by accident.
     DERIV_ACCOUNT_ID    - optional; skips the accounts lookup and uses this
                            account_id directly
-
-SUPABASE PERSISTENCE (Railway has no persistent filesystem):
-    SUPABASE_URL        - e.g. https://xxxxxxxxxxxx.supabase.co
-    SUPABASE_KEY        - service_role key from Supabase Settings → API
-
-    Run this SQL once in Supabase SQL editor before first Railway deploy:
-
-        CREATE TABLE IF NOT EXISTS bot_trade_log (
-            id          BIGSERIAL PRIMARY KEY,
-            ts          TIMESTAMPTZ DEFAULT now(),
-            symbol      TEXT,
-            direction   INTEGER,
-            step        INTEGER,
-            stake       REAL,
-            won         BOOLEAN,
-            profit      REAL,
-            p_up        REAL,
-            confidence  REAL,
-            duration    INTEGER,
-            layer_votes JSONB,
-            n_agree     INTEGER,
-            n_disagree  INTEGER
-        );
-
-        CREATE TABLE IF NOT EXISTS bot_symbol_state (
-            symbol        TEXT PRIMARY KEY,
-            reliability   REAL,
-            threshold     REAL,
-            step0_wins    INTEGER DEFAULT 0,
-            step0_total   INTEGER DEFAULT 0,
-            layer_weights JSONB  DEFAULT '{}',
-            updated_at    TIMESTAMPTZ DEFAULT now()
-        );
-
-        CREATE TABLE IF NOT EXISTS bot_gate_config (
-            key        TEXT PRIMARY KEY,
-            value      REAL,
-            updated_at TIMESTAMPTZ DEFAULT now()
-        );
 """
 
 import asyncio
@@ -119,14 +80,6 @@ DERIV_API_TOKEN = os.getenv("DERIV_API_TOKEN")
 DERIV_ACCOUNT_TYPE = os.getenv("DERIV_ACCOUNT_TYPE", "demo").strip().lower()
 DERIV_ACCOUNT_ID = os.getenv("DERIV_ACCOUNT_ID") or None
 
-# ── Supabase persistence (Railway has no persistent filesystem) ──
-# Set these in Railway environment variables:
-#   SUPABASE_URL  → e.g. https://xxxxxxxxxxxx.supabase.co
-#   SUPABASE_KEY  → service_role key (Settings → API in Supabase dashboard)
-# Run the SQL in the module docstring once in Supabase SQL editor before first deploy.
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").rstrip("/")
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "")
-
 # ── Connection (new Deriv Options API) ──
 API_BASE = "https://api.derivws.com"
 ACCOUNTS_PATH = "/trading/v1/options/accounts"
@@ -135,8 +88,8 @@ OTP_PATH = "/trading/v1/options/accounts/{account_id}/otp"
 MIN_STAKE = 0.35
 STAKE_PCT = 0.02                       # stake = max(MIN_STAKE, balance * STAKE_PCT)
 
-MARTINGALE_FACTOR = 1.6
-MARTINGALE_MAX_STEPS = 6               # up to 3 recovery steps after the initial stake
+MARTINGALE_FACTOR = 1.24
+MARTINGALE_MAX_STEPS = 3               # up to 3 recovery steps after the initial stake
 
 SCHEDULED_CALIBRATION_INTERVAL = 2 * 60 * 60   # seconds — full deep recal every 2 hours
 CALIBRATION_COOLDOWN = 5 * 60                  # grace period after calibration ends
@@ -154,7 +107,7 @@ MIN_SCORE_GAP = 0.05
 # 12/16 layers must agree (75% supermajority). No more than 3 allowed to
 # actively oppose. This eliminates all the 9-agree / 5-disagree borderline
 # entries that the logs showed were the source of losses.
-MIN_LAYER_AGREE    = 10                # minimum layers voting FOR direction (75% of 16)
+MIN_LAYER_AGREE    = 12                # minimum layers voting FOR direction (75% of 16)
 MAX_LAYER_DISAGREE = 3                 # maximum layers allowed to vote AGAINST
 
 # ── Monte Carlo quality floor ─────────────────────────────────────────────
@@ -172,7 +125,7 @@ ADAPTIVE_THRESHOLD_PERCENTILE = 75
 # the next entry. No rate limiter — every loss gets a fresh recal.
 POST_LOSS_DEEP_RECAL = True            # set False to disable (use scheduled recal only)
 CANDIDATE_DURATIONS = [1, 3, 5, 7, 10]   # ticks — Deriv only accepts 1-10 tick contracts
-MC_SIMULATIONS = 1000
+MC_SIMULATIONS = 500
 
 WATCHDOG_TIMEOUT = 5 * 60              # seconds of total silence (no tick, no loop iteration)
                                         # before the bot force-restarts itself in place
@@ -180,187 +133,6 @@ WATCHDOG_CHECK_INTERVAL = 20           # how often the watchdog checks for stale
 
 MIN_TICKS_FOR_FIT = 200                # minimum ticks before a model can be fitted
 MIN_TICKS_LIVE = 60                    # minimum ticks before live layers (Markov etc.) run
-
-
-# ---------------------------------------------------------------------------
-# SUPABASE PERSISTENCE STORE
-# Railway's filesystem is ephemeral — every restart wipes in-memory state.
-# SupabaseStore is the single exit point for all learned state: layer weights,
-# per-symbol thresholds, reliability scores, win counts, and trade history.
-# All methods are synchronous (requests) so they can be called from the
-# calibration block without async overhead. Failures are always swallowed —
-# the bot degrades gracefully to in-memory-only state if Supabase is down.
-# ---------------------------------------------------------------------------
-class SupabaseStore:
-    def __init__(self):
-        self.url = SUPABASE_URL
-        self.key = SUPABASE_KEY
-        self.ok  = bool(self.url and self.key)
-        if self.ok:
-            print(f"[Store] Supabase persistence active → {self.url}")
-        else:
-            print("[Store] SUPABASE_URL / SUPABASE_KEY not set — "
-                  "learned state will NOT persist across Railway restarts.")
-
-    def _headers(self, prefer="return=minimal"):
-        return {
-            "apikey":        self.key,
-            "Authorization": f"Bearer {self.key}",
-            "Content-Type":  "application/json",
-            "Prefer":        prefer,
-        }
-
-    def _upsert(self, table, payload):
-        """POST with resolution=merge-duplicates so PRIMARY KEY rows are updated."""
-        if not self.ok:
-            return
-        try:
-            r = requests.post(
-                f"{self.url}/rest/v1/{table}",
-                headers=self._headers("resolution=merge-duplicates,return=minimal"),
-                json=payload, timeout=10,
-            )
-            if r.status_code not in (200, 201, 204):
-                print(f"[Store] {table} upsert error {r.status_code}: {r.text[:160]}")
-        except Exception as e:
-            print(f"[Store] {table} upsert failed: {e}")
-
-    def _insert(self, table, payload):
-        """Plain INSERT for append-only tables (trade_log)."""
-        if not self.ok:
-            return
-        try:
-            r = requests.post(
-                f"{self.url}/rest/v1/{table}",
-                headers=self._headers(),
-                json=payload, timeout=10,
-            )
-            if r.status_code not in (200, 201, 204):
-                print(f"[Store] {table} insert error {r.status_code}: {r.text[:160]}")
-        except Exception as e:
-            print(f"[Store] {table} insert failed: {e}")
-
-    def _select(self, table, query="select=*"):
-        if not self.ok:
-            return []
-        try:
-            r = requests.get(
-                f"{self.url}/rest/v1/{table}?{query}",
-                headers=self._headers("return=representation"),
-                timeout=12,
-            )
-            if r.status_code == 200:
-                return r.json()
-            print(f"[Store] {table} select error {r.status_code}: {r.text[:160]}")
-        except Exception as e:
-            print(f"[Store] {table} select failed: {e}")
-        return []
-
-    # ── Trade log (append-only, full feature snapshot) ─────────────────────
-    def save_trade(self, symbol, direction, step, stake, won, profit,
-                   p_up, confidence, duration, feats):
-        """Logged on every step=0 result. feats dict carries all 16 layer signals."""
-        votes = {}
-        if feats:
-            votes = {
-                "markov":    round((feats.get("markov_p", 0.5) - 0.5) * 2, 4),
-                "hmm":       round(feats.get("hmm_lean",     0), 4),
-                "hawkes":    round(feats.get("hawkes",        0), 4),
-                "ou":        round(feats.get("ou_dir",        0) * feats.get("ou_strength", 0), 4),
-                "hurst":     round(feats.get("hurst_signal",  0), 4),
-                "arfima":    round(feats.get("arfima_bias",   0), 4),
-                "kalman":    round(feats.get("kalman",        0), 4),
-                "copula":    round((feats.get("copula_agree", 0.5) - 0.5) * 2, 4),
-                "rsi":       round(feats.get("rsi_signal",    0), 4),
-                "srsi":      round(feats.get("srsi_signal",   0), 4),
-                "adx":       round(feats.get("adx_dir",       0) * feats.get("adx_trend", 0), 4),
-                "boll":      round(feats.get("boll_signal",   0), 4),
-                "zscore":    round(feats.get("z_signal",      0), 4),
-                "te":        round(feats.get("te_signal",     0), 4),
-                "jump":      round(feats.get("jump_dir",      0) * feats.get("jump_intensity", 0), 4),
-                "post_jump": round(feats.get("post_jump",     0) * feats.get("jump_intensity", 0), 4),
-            }
-        self._insert("bot_trade_log", {
-            "ts":          datetime.utcnow().isoformat(),
-            "symbol":      symbol,
-            "direction":   int(direction),
-            "step":        int(step),
-            "stake":       round(float(stake), 4),
-            "won":         bool(won),
-            "profit":      round(float(profit), 4),
-            "p_up":        round(float(p_up), 6),
-            "confidence":  round(float(confidence), 6),
-            "duration":    int(duration),
-            "layer_votes": json.dumps(votes),
-            "n_agree":     int(feats.get("agree_up",    0)) if feats else 0,
-            "n_disagree":  int(feats.get("disagree_up", 0)) if feats else 0,
-        })
-
-    # ── Symbol state (upsert after every calibration) ──────────────────────
-    def save_symbol_state(self, state):
-        rows = []
-        for s, m in state.model_cache.items():
-            rows.append({
-                "symbol":        s,
-                "reliability":   round(float(state.reliability.get(s, 1.0)), 6),
-                "threshold":     round(float(state.per_symbol_threshold.get(
-                                       s, state.adaptive_threshold)), 6),
-                "step0_wins":    int(state.step0_wins.get(s, 0)),
-                "step0_total":   int(state.step0_total.get(s, 0)),
-                "layer_weights": json.dumps(m.per_layer_weights or {}),
-                "updated_at":    datetime.utcnow().isoformat(),
-            })
-        for row in rows:
-            self._upsert("bot_symbol_state", row)
-        print(f"[Store] Saved state for {len(rows)} symbols to Supabase.")
-
-    def load_symbol_state(self, state):
-        """Called at startup before calibration. Pre-seeds reliability,
-        thresholds, win counts, and previously learned layer weights so
-        the first post-restart calibration has a warm start rather than
-        reverting to static defaults."""
-        rows = self._select("bot_symbol_state")
-        if not rows:
-            print("[Store] No prior symbol state found in Supabase — cold start.")
-            return
-        if not hasattr(state, '_pending_weights'):
-            state._pending_weights = {}
-        for row in rows:
-            s = row["symbol"]
-            state.reliability[s]          = float(row.get("reliability", 1.0))
-            state.per_symbol_threshold[s] = float(row.get("threshold",   state.adaptive_threshold))
-            state.step0_wins[s]           = int(row.get("step0_wins",   0))
-            state.step0_total[s]          = int(row.get("step0_total",  0))
-            raw_w = row.get("layer_weights") or "{}"
-            weights = json.loads(raw_w) if isinstance(raw_w, str) else (raw_w or {})
-            if weights:
-                # Pending weights are merged into models after fit completes
-                # so calibration's OOS-learned weights take precedence, but
-                # the Supabase weights are blended in if OOS data is insufficient.
-                state._pending_weights[s] = weights
-        print(f"[Store] Warm-started state for {len(rows)} symbols from Supabase.")
-
-    # ── Gate config (persists auto-tuned gate values) ──────────────────────
-    def save_gates(self, min_agree, max_disagree, min_exp_wr, adaptive_thr):
-        for key, val in [
-            ("min_layer_agree",    float(min_agree)),
-            ("max_layer_disagree", float(max_disagree)),
-            ("min_exp_win_rate",   float(min_exp_wr)),
-            ("adaptive_threshold", float(adaptive_thr)),
-        ]:
-            self._upsert("bot_gate_config", {
-                "key": key, "value": round(val, 6),
-                "updated_at": datetime.utcnow().isoformat(),
-            })
-
-    def load_gates(self):
-        rows = self._select("bot_gate_config", "select=key,value")
-        return {row["key"]: float(row["value"]) for row in rows}
-
-
-# Module-level store singleton. Instantiated once in main() so the
-# Railway env vars are resolved. All other modules reference _store directly.
-_store: Optional[SupabaseStore] = None
 
 
 # ---------------------------------------------------------------------------
@@ -398,13 +170,6 @@ class TradeState:
         # the only metric that honestly reveals whether the signal has edge
         self.step0_wins   = defaultdict(int)
         self.step0_total  = defaultdict(int)
-
-        # Self-improvement bookkeeping
-        # _pending_weights: layer weights loaded from Supabase at startup,
-        #   merged into models after fit so warm restarts keep prior learning.
-        # _trades_since_autotune: counts step-0 trades since last gate tune.
-        self._pending_weights: Dict[str, dict] = {}
-        self._trades_since_autotune = 0
 
         # Sequence accumulator — tracks stakes/profits across martingale steps
         # so log_trade_summary has the full picture when the sequence closes
@@ -1048,92 +813,135 @@ def arfima_bias(returns, hurst, lookback=150):
 # ---------------------------------------------------------------------------
 # CONFIRMATION LAYERS (L13-L18) — no model fitting needed, evaluate live
 # ---------------------------------------------------------------------------
-def compute_rsi(prices, period=14):
-    """L13a: RSI. Returns (rsi_value, signal) where signal is +1 (oversold,
-    expect up), -1 (overbought, expect down), 0 (neutral)."""
+def compute_rsi(prices, period=14, momentum_mode=False):
+    """L13a: RSI. Returns (rsi_value, signal).
+
+    Regime-aware polarity:
+      momentum_mode=False (ranging)  — classic mean-reversion:
+        oversold (RSI<30) → +signal (expect up),  overbought (RSI>70) → -signal
+      momentum_mode=True  (trending) — momentum confirmation:
+        RSI>55 → +signal (trend continues up),    RSI<45 → -signal (trend continues down)
+
+    The caller computes momentum_mode from HMM trend_weight + Hurst so the signal
+    automatically flips polarity when the detected regime changes."""
     if len(prices) < period + 2:
         return 50.0, 0.0
-    deltas = np.diff(prices[-(period + 2):])
-    gains  = np.where(deltas > 0, deltas, 0.0)
-    losses = np.where(deltas < 0, -deltas, 0.0)
+    deltas   = np.diff(prices[-(period + 2):])
+    gains    = np.where(deltas > 0, deltas, 0.0)
+    losses   = np.where(deltas < 0, -deltas, 0.0)
     avg_gain = np.mean(gains[-period:])
     avg_loss = np.mean(losses[-period:])
     if avg_loss == 0:
-        return 100.0, -1.0
-    rs  = avg_gain / avg_loss
-    rsi = 100.0 - (100.0 / (1 + rs))
-    if rsi < 30:
-        signal = (30 - rsi) / 30         # +1 at RSI=0, 0 at RSI=30
-    elif rsi > 70:
-        signal = -(rsi - 70) / 30        # -1 at RSI=100, 0 at RSI=70
+        rsi = 100.0
     else:
-        signal = 0.0
+        rs  = avg_gain / avg_loss
+        rsi = 100.0 - (100.0 / (1 + rs))
+
+    if momentum_mode:
+        # Trending: overbought confirms upward continuation, oversold confirms downward
+        if rsi > 55:
+            signal = (rsi - 55) / 45     # 0 at RSI=55 → +1 at RSI=100
+        elif rsi < 45:
+            signal = -(45 - rsi) / 45    # 0 at RSI=45 → -1 at RSI=0
+        else:
+            signal = 0.0
+    else:
+        # Ranging: overbought → fade up, oversold → fade down
+        if rsi < 30:
+            signal = (30 - rsi) / 30     # +1 at RSI=0, 0 at RSI=30
+        elif rsi > 70:
+            signal = -(rsi - 70) / 30    # -1 at RSI=100, 0 at RSI=70
+        else:
+            signal = 0.0
     return float(rsi), float(np.clip(signal, -1, 1))
 
 
-def compute_stoch_rsi(prices, rsi_period=14, stoch_period=14):
-    """L13b: Stochastic RSI. More sensitive than plain RSI for
-    short-term overbought/oversold on fast synthetic-index tick data."""
+def compute_stoch_rsi(prices, rsi_period=14, stoch_period=14, momentum_mode=False):
+    """L13b: Stochastic RSI. Regime-aware polarity (same logic as compute_rsi).
+
+    momentum_mode=False → mean-reversion: stoch<0.2 = +signal, stoch>0.8 = -signal
+    momentum_mode=True  → momentum:       stoch>0.6 = +signal, stoch<0.4 = -signal"""
     if len(prices) < rsi_period + stoch_period + 5:
         return 0.5, 0.0
     rsi_series = []
     for i in range(stoch_period):
-        idx = -(stoch_period - i + rsi_period)
-        rsi_val, _ = compute_rsi(prices[:len(prices) - (stoch_period - i - 1)], rsi_period)
+        rsi_val, _ = compute_rsi(prices[:len(prices) - (stoch_period - i - 1)],
+                                  rsi_period, momentum_mode=False)   # always raw RSI for the series
         rsi_series.append(rsi_val)
     rsi_series = np.array(rsi_series)
     lo, hi = np.min(rsi_series), np.max(rsi_series)
     if hi == lo:
         return 0.5, 0.0
     stoch_k = (rsi_series[-1] - lo) / (hi - lo)
-    signal = 0.0
-    if stoch_k < 0.2:
-        signal = (0.2 - stoch_k) / 0.2
-    elif stoch_k > 0.8:
-        signal = -(stoch_k - 0.8) / 0.2
+
+    if momentum_mode:
+        # Trending: high stoch confirms upward momentum continuation
+        if stoch_k > 0.6:
+            signal = (stoch_k - 0.6) / 0.4   # 0 at 0.6 → +1 at 1.0
+        elif stoch_k < 0.4:
+            signal = -(0.4 - stoch_k) / 0.4  # 0 at 0.4 → -1 at 0.0
+        else:
+            signal = 0.0
+    else:
+        # Ranging: mean-reversion — extreme stoch levels expect a snap-back
+        if stoch_k < 0.2:
+            signal = (0.2 - stoch_k) / 0.2
+        elif stoch_k > 0.8:
+            signal = -(stoch_k - 0.8) / 0.2
+        else:
+            signal = 0.0
     return float(stoch_k), float(np.clip(signal, -1, 1))
 
 
 def compute_adx(prices, period=14):
     """L14: ADX trend-strength filter. ADX > 25 = trending (trust momentum
     layers), ADX < 20 = ranging (trust mean-reversion layers).
-    Returns (adx_value, trend_strength_0_to_1, +DI > -DI = up_bias)."""
+    Returns (adx_value, trend_strength_0_to_1, +DI > -DI = up_bias).
+
+    BUG FIX vs original: the original set highs=lows=prices, making
+    TR = abs(prices[i]-prices[i]) = 0 always, so ATR=0 and the function
+    returned early with up_bias=0.0 on every single call (confirmed by
+    trade log: adx always 0.0). For tick data, TR must use consecutive
+    price differences, not intra-bar high-low range."""
     if len(prices) < period * 2 + 2:
         return 20.0, 0.3, 0.0
-    highs  = prices  # for tick data, use price as both H/L proxy
-    lows   = prices
-    closes = prices
     n = len(prices)
     tr_list, pdm_list, ndm_list = [], [], []
     for i in range(1, n):
-        tr  = abs(highs[i] - lows[i])
-        pdm = max(highs[i] - highs[i-1], 0)
-        ndm = max(lows[i-1] - lows[i], 0)
-        if pdm < ndm: pdm = 0
-        elif ndm < pdm: ndm = 0
-        tr_list.append(tr); pdm_list.append(pdm); ndm_list.append(ndm)
-    tr_a  = np.array(tr_list[-period*2:])
-    pdm_a = np.array(pdm_list[-period*2:])
-    ndm_a = np.array(ndm_list[-period*2:])
+        # True range for tick data = absolute price change tick-to-tick
+        tr  = abs(prices[i] - prices[i-1])
+        # +DM = upward move; -DM = downward move (mutually exclusive)
+        pdm = max(prices[i] - prices[i-1], 0.0)
+        ndm = max(prices[i-1] - prices[i], 0.0)
+        tr_list.append(tr)
+        pdm_list.append(pdm)
+        ndm_list.append(ndm)
+    tr_a  = np.array(tr_list[-period * 2:])
+    pdm_a = np.array(pdm_list[-period * 2:])
+    ndm_a = np.array(ndm_list[-period * 2:])
     atr   = np.mean(tr_a[-period:])
     if atr == 0:
         return 20.0, 0.3, 0.0
     pdi = 100 * np.mean(pdm_a[-period:]) / atr
     ndi = 100 * np.mean(ndm_a[-period:]) / atr
     dx  = 100 * abs(pdi - ndi) / (pdi + ndi + 1e-9)
-    adx = float(np.mean([100 * abs(pdm_a[i] - ndm_a[i]) /
-                         (np.mean(tr_a[:i+1]) * period + 1e-9)
-                         for i in range(period, len(tr_a))]) if len(tr_a) > period else dx)
+    # Smooth DX into ADX over the second half of the window
+    adx_vals = []
+    for i in range(period, len(tr_a)):
+        atr_i = np.mean(tr_a[max(0, i-period):i]) * period + 1e-9
+        adx_vals.append(100 * abs(pdm_a[i] - ndm_a[i]) / atr_i)
+    adx = float(np.mean(adx_vals)) if adx_vals else dx
     adx = float(np.clip(adx, 0, 100))
     trend_strength = float(np.clip((adx - 20) / 30, 0, 1))  # 0 at ADX=20, 1 at ADX=50
-    up_bias = float(np.sign(pdi - ndi))
+    up_bias        = float(np.sign(pdi - ndi))
     return adx, trend_strength, up_bias
 
 
-def compute_bollinger(prices, period=20, n_std=2.0):
-    """L15: Bollinger Band %B. Confirms OU mean-reversion signals.
-    %B near 0 = price at lower band (oversold), near 1 = upper band (overbought).
-    Signal: positive = expect up (below mid), negative = expect down (above mid)."""
+def compute_bollinger(prices, period=20, n_std=2.0, momentum_mode=False):
+    """L15: Bollinger Band %B. Regime-aware polarity.
+
+    momentum_mode=False (ranging)  — mean-reversion: price at upper band → expect down
+    momentum_mode=True  (trending) — momentum: price at upper band → trend continues up"""
     if len(prices) < period + 2:
         return 0.5, 0.0
     window = prices[-period:]
@@ -1141,24 +949,34 @@ def compute_bollinger(prices, period=20, n_std=2.0):
     std    = np.std(window)
     if std == 0:
         return 0.5, 0.0
-    upper   = mid + n_std * std
-    lower   = mid - n_std * std
-    pct_b   = (prices[-1] - lower) / (upper - lower + 1e-9)
-    pct_b   = float(np.clip(pct_b, -0.5, 1.5))
-    signal  = float(np.clip((0.5 - pct_b) * 2, -1, 1))   # +1 at lower band, -1 at upper
+    upper  = mid + n_std * std
+    lower  = mid - n_std * std
+    pct_b  = (prices[-1] - lower) / (upper - lower + 1e-9)
+    pct_b  = float(np.clip(pct_b, -0.5, 1.5))
+    if momentum_mode:
+        # Trending: price near upper band = upward momentum continuation
+        signal = float(np.clip((pct_b - 0.5) * 2, -1, 1))   # +1 at upper, -1 at lower
+    else:
+        # Ranging: price near upper band = overbought, expect reversion down
+        signal = float(np.clip((0.5 - pct_b) * 2, -1, 1))   # +1 at lower, -1 at upper
     return pct_b, signal
 
 
-def compute_zscore(prices, period=50):
-    """L16: Z-score of current price vs rolling mean. Confirms or contradicts
-    OU reversion direction. Strong signal when Z > 2 or < -2."""
+def compute_zscore(prices, period=50, momentum_mode=False):
+    """L16: Z-score of current price vs rolling mean. Regime-aware polarity.
+
+    momentum_mode=False (ranging)  — mean-reversion: high z → expect down (fade the move)
+    momentum_mode=True  (trending) — momentum: high z → trend continues up (follow the move)"""
     if len(prices) < period + 2:
         return 0.0, 0.0
     window = prices[-period:]
     mu     = np.mean(window)
     sigma  = np.std(window) if np.std(window) > 0 else 1e-9
     z      = (prices[-1] - mu) / sigma
-    signal = float(np.clip(-z / 2, -1, 1))   # negative z = below mean = expect up
+    if momentum_mode:
+        signal = float(np.clip(z / 2, -1, 1))    # follow the move: high z = up signal
+    else:
+        signal = float(np.clip(-z / 2, -1, 1))   # fade the move: high z = down signal
     return float(z), signal
 
 
@@ -1417,11 +1235,23 @@ def compute_features(sd, models, returns_window_dict):
     copula     = copula_agreement(sd.symbol, returns_window_dict)
 
     # ── Confirmation layers (L13-L18) ───────────────────────────────────────
-    _,    rsi_signal   = compute_rsi(prices)
-    _,    srsi_signal  = compute_stoch_rsi(prices)
+    # Regime classification: combine HMM trend_weight + Hurst exponent to decide
+    # whether confirmation layers should operate in momentum or mean-reversion mode.
+    #
+    #   Trending  (momentum_mode=True) : trend_weight > 0.60  AND  H > 0.52
+    #     → RSI/StochRSI/Bollinger/Z-score all FOLLOW the prevailing direction
+    #   Ranging   (momentum_mode=False): everything else
+    #     → classic mean-reversion: overbought = fade, oversold = fade
+    #
+    # ADX confirmation: if ADX is strongly trending (adx_trend > 0.5) it independently
+    # shifts its own weight higher in bayesian_fusion — no polarity issue there.
+    momentum_mode = bool(trend_weight > 0.60 and h > 0.52)
+
+    _,    rsi_signal   = compute_rsi(prices, momentum_mode=momentum_mode)
+    _,    srsi_signal  = compute_stoch_rsi(prices, momentum_mode=momentum_mode)
     adx_val, adx_trend, adx_dir = compute_adx(prices)
-    _,    boll_signal  = compute_bollinger(prices)
-    z_val, z_signal    = compute_zscore(prices)
+    _,    boll_signal  = compute_bollinger(prices, momentum_mode=momentum_mode)
+    z_val, z_signal    = compute_zscore(prices, momentum_mode=momentum_mode)
 
     # transfer entropy: average signal from all OTHER symbols toward this one
     te_signal = 0.0
@@ -1493,6 +1323,7 @@ def compute_features(sd, models, returns_window_dict):
         "z_signal":     z_signal,
         "z_val":        z_val,
         "te_signal":    te_signal,
+        "momentum_mode": momentum_mode,   # regime flag logged to trade journal
         "jump_intensity": jump_intensity,
         "jump_dir":     jump_dir,
         "post_jump":    post_jump,
@@ -1549,17 +1380,27 @@ def bayesian_fusion(features):
 
     # ── Confirmation layers (incremental, lower base weight) ────────────────
     adx_trust = features["adx_trend"]   # 0 = ranging, 1 = strongly trending
-    # RSI/StochRSI agree on direction: boost weight; disagree: reduce
+    momentum_mode = features.get("momentum_mode", False)
+
+    # RSI/StochRSI agreement bonus: when both agree on direction, boost weight;
+    # when they disagree (one flipped by regime, other not), reduce weight.
     rsi_agree = 1.0 if (features["rsi_signal"] * features["srsi_signal"]) >= 0 else 0.4
-    # Bollinger and Z-score both measure price stretch — agree: boost
+    # Bollinger and Z-score agreement bonus
     bz_agree  = 1.0 if (features["boll_signal"] * features["z_signal"]) >= 0 else 0.4
 
+    # Regime confidence scalar: how certain we are of the detected regime.
+    # In trending mode, HMM trend_weight and Hurst both point the same way → high confidence.
+    # In ranging mode, signals are subtler — use a modest confidence scalar.
+    regime_conf = float(np.clip(abs(trend_w - 0.5) * 2 + abs(hurst_w - 0.5) * 2, 0, 1))
+
     evidence += [
-        (features["rsi_signal"],                               W("rsi",      0.35) * rsi_agree),
-        (features["srsi_signal"],                              W("srsi",     0.30) * rsi_agree),
-        (features["adx_dir"]     * adx_trust,                 W("adx",      0.35)),
-        (features["boll_signal"]                             , W("boll",     0.30) * bz_agree),
-        (features["z_signal"],                                 W("zscore",   0.30) * bz_agree),
+        (features["rsi_signal"],                               W("rsi",      0.35) * rsi_agree * (1 + regime_conf * 0.5)),
+        (features["srsi_signal"],                              W("srsi",     0.30) * rsi_agree * (1 + regime_conf * 0.5)),
+        # ADX now produces real signal after tick-data TR fix — give it proper weight
+        # Scale by adx_trust so it only contributes when trend strength is confirmed
+        (features["adx_dir"]     * adx_trust,                 W("adx",      0.40) * (0.5 + adx_trust)),
+        (features["boll_signal"]                             , W("boll",     0.30) * bz_agree * (1 + regime_conf * 0.4)),
+        (features["z_signal"],                                 W("zscore",   0.30) * bz_agree * (1 + regime_conf * 0.4)),
         (features["te_signal"],                                W("te",       0.30)),
         # Jump: during jump use jump_dir, post-jump use reversion signal
         (features["jump_dir"]    * features["jump_intensity"], W("jump",     0.25)),
@@ -1576,104 +1417,6 @@ def bayesian_fusion(features):
     p_up       = float(np.clip(1.0 / (1.0 + math.exp(-log_odds)), 0.01, 0.99))
     confidence = abs(p_up - 0.5) * 2.0 * total_trust
     return p_up, confidence
-
-
-# ---------------------------------------------------------------------------
-# SELF-IMPROVEMENT: ONLINE LAYER WEIGHT UPDATE
-# After each step-0 trade outcome, nudge each layer's fusion weight toward
-# its actual predictive value on THIS result. This runs every trade — between
-# the scheduled 2-hour calibrations — so the bot adapts continuously rather
-# than only at calibration time.
-#
-# The update rule is a reward/punish gradient step:
-#   won  + layer agreed   → reward  (weight nudged up)
-#   won  + layer opposed  → punish  (layer added noise — nudge down)
-#   lost + layer agreed   → punish  (layer voted wrong — nudge down)
-#   lost + layer opposed  → reward  (layer saw the truth — nudge up)
-#
-# lr=0.04 means ~4% shift per trade. With 10-20 trades per symbol it takes
-# 1-2 sessions to meaningfully differentiate useful layers from noise.
-# ---------------------------------------------------------------------------
-def online_update_layer_weights(models: SymbolModels, feats: dict,
-                                direction: int, won: bool, lr: float = 0.04):
-    if models is None or feats is None:
-        return
-    layer_signals = {
-        "markov":    (feats.get("markov_p",     0.5) - 0.5) * 2,
-        "hmm":        feats.get("hmm_lean",      0),
-        "hawkes":     feats.get("hawkes",         0),
-        "ou":         feats.get("ou_dir",         0) * feats.get("ou_strength", 0),
-        "hurst":      feats.get("hurst_signal",   0),
-        "arfima":     feats.get("arfima_bias",    0),
-        "kalman":     feats.get("kalman",         0),
-        "copula":    (feats.get("copula_agree",  0.5) - 0.5) * 2,
-        "rsi":        feats.get("rsi_signal",     0),
-        "srsi":       feats.get("srsi_signal",    0),
-        "adx":        feats.get("adx_dir",        0) * feats.get("adx_trend", 0),
-        "boll":       feats.get("boll_signal",    0),
-        "zscore":     feats.get("z_signal",       0),
-        "te":         feats.get("te_signal",      0),
-        "jump":       feats.get("jump_dir",       0) * feats.get("jump_intensity", 0),
-        "post_jump":  feats.get("post_jump",      0) * feats.get("jump_intensity", 0),
-    }
-    w       = dict(models.per_layer_weights or {})
-    outcome = 1 if won else -1
-    for layer, signal in layer_signals.items():
-        if abs(signal) < 0.01:
-            continue    # neutral — no information to learn from
-        agreement = 1 if signal * direction > 0 else -1
-        reward    = outcome * agreement
-        current_w = w.get(layer, 1.0)
-        w[layer]  = float(np.clip(current_w + lr * reward * abs(current_w), 0.05, 3.0))
-    models.per_layer_weights = w
-
-
-# ---------------------------------------------------------------------------
-# SELF-IMPROVEMENT: AUTO-TUNE ENTRY GATES FROM ROLLING WIN RATE
-# Observes the rolling step-0 win rate and adjusts the three main hard gates
-# (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE) accordingly.
-# Called after every 50 step-0 trades and after every calibration.
-# Changes are persisted to Supabase so Railway restarts inherit them.
-# ---------------------------------------------------------------------------
-def autotune_gates(state):
-    global MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
-    total_wins   = sum(state.step0_wins.values())
-    total_trades = sum(state.step0_total.values())
-    if total_trades < 50:
-        return    # not enough signal yet
-    wr = total_wins / total_trades
-    changed = False
-
-    if wr < 0.46:
-        # Losing too much — tighten all three gates
-        new_agree  = min(MIN_LAYER_AGREE    + 1,    14)
-        new_dis    = max(MAX_LAYER_DISAGREE - 1,    1)
-        new_mc     = min(MIN_EXP_WIN_RATE   + 0.01, 0.58)
-        if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
-            MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
-            changed = True
-            print(f"[AutoTune] step-0 WR={wr:.3f} over {total_trades} trades < 0.46 "
-                  f"→ TIGHTENED: agree>={MIN_LAYER_AGREE} "
-                  f"disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
-
-    elif wr > 0.54 and total_trades >= 100:
-        # Winning well — relax slightly to increase trade frequency
-        new_agree  = max(MIN_LAYER_AGREE    - 1,    10)
-        new_dis    = min(MAX_LAYER_DISAGREE + 1,    4)
-        new_mc     = max(MIN_EXP_WIN_RATE   - 0.01, 0.50)
-        if (new_agree, new_dis, new_mc) != (MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE):
-            MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE = new_agree, new_dis, new_mc
-            changed = True
-            print(f"[AutoTune] step-0 WR={wr:.3f} over {total_trades} trades > 0.54 "
-                  f"→ RELAXED: agree>={MIN_LAYER_AGREE} "
-                  f"disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f}")
-    else:
-        print(f"[AutoTune] step-0 WR={wr:.3f} over {total_trades} trades — gates unchanged "
-              f"(agree>={MIN_LAYER_AGREE} disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f})")
-
-    if changed and _store:
-        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
-                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
 
 
 # ---------------------------------------------------------------------------
@@ -1884,6 +1627,10 @@ def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win
     entropy_state= ("HIGH — low structure"  if feats["entropy_trust"] < 0.4
                     else "MODERATE" if feats["entropy_trust"] < 0.65
                     else "low — market is structured")
+    conf_layer_mode = ("MOMENTUM  (RSI/StochRSI/Boll/Z-score follow trend)"
+                       if feats.get("momentum_mode") else
+                       "MEAN-REVERSION  (RSI/StochRSI/Boll/Z-score fade extremes)")
+    adx_str      = f"ADX={feats['adx_val']:.1f} trend_str={feats['adx_trend']:.2f} dir={feats['adx_dir']:+.0f}"
 
     print(f"\n{sep}")
     print(f"  TRADE SIGNAL  {ts}")
@@ -1896,8 +1643,10 @@ def explain_signal(symbol, direction, feats, p_up, confidence, duration, exp_win
     print("\n  Market regime:")
     print(f"    Hurst H={feats['hurst']:.3f}  → {hurst_regime}")
     print(f"    HMM trend_weight={feats['trend_weight']:.2f}  → {hmm_regime}")
-    print(f"    Volatility state → {vol_state}")
-    print(f"    Entropy state    → {entropy_state}")
+    print(f"    Confirmation mode → {conf_layer_mode}")
+    print(f"    {adx_str}")
+    print(f"    Volatility state  → {vol_state}")
+    print(f"    Entropy state     → {entropy_state}")
     print(f"\n  Layer breakdown  [{agree} agree | {disagree} disagree | {neutral} neutral]")
     print(f"  {'Layer':<20}  {'Signal':>7}  {'Direction bar (±1)':^22}")
     print(f"  {'-'*20}  {'-'*7}  {'-'*22}")
@@ -1982,27 +1731,6 @@ async def execute_single_step(client, state, symbol, direction, stake, step, dur
         state.step0_total[symbol] += 1
         if won:
             state.step0_wins[symbol] += 1
-
-        # ── Online layer weight update ──────────────────────────────────────
-        # Nudge fusion weights immediately from this trade outcome so the bot
-        # adapts between calibrations rather than only at the 2-hour mark.
-        if feats is not None:
-            models_ref = state.model_cache.get(symbol)
-            if models_ref is not None:
-                online_update_layer_weights(models_ref, feats, direction, won)
-
-        # ── Persist trade to Supabase ───────────────────────────────────────
-        if _store is not None and feats is not None:
-            _store.save_trade(
-                symbol, direction, step, stake, won, profit,
-                state.seq_p_up, state.seq_confidence, state.seq_duration, feats,
-            )
-
-        # ── Auto-tune gates every 50 step-0 trades ─────────────────────────
-        state._trades_since_autotune += 1
-        if state._trades_since_autotune >= 50:
-            autotune_gates(state)
-            state._trades_since_autotune = 0
 
     try:
         bal_resp = await client.send({"balance": 1})
@@ -2338,25 +2066,6 @@ async def deep_startup_calibration(state, symbol_data, symbols):
 
             state.model_cache[s] = m
 
-            # ── Warm-start: blend in Supabase-persisted weights ───────────
-            # If OOS data produced learned weights those take precedence.
-            # If OOS was insufficient (per_layer_weights=None), fall back to
-            # the weights that survived the last Railway restart via Supabase.
-            pending = state._pending_weights.get(s)
-            if pending:
-                if m.per_layer_weights is None:
-                    m.per_layer_weights = pending
-                    print(f"  Warm weights      : restored from Supabase (no OOS weights this run)")
-                else:
-                    # Blend: 70% fresh OOS weights, 30% prior persisted weights
-                    all_keys = set(m.per_layer_weights) | set(pending)
-                    m.per_layer_weights = {
-                        k: round(0.7 * m.per_layer_weights.get(k, 1.0)
-                                 + 0.3 * pending.get(k, 1.0), 6)
-                        for k in all_keys
-                    }
-                    print(f"  Warm weights      : blended OOS 70% + Supabase prior 30%")
-
         state.reliability[s] = float(np.clip(report["mean_hit_rate"] / 0.5, 0.3, 1.5))
         symbol_reports[s]    = report
 
@@ -2409,13 +2118,6 @@ async def deep_startup_calibration(state, symbol_data, symbols):
     state.last_activity              = time.time()
     state.trading_locked             = False
 
-    # ── Persist all learned state to Supabase ──────────────────────────────
-    if _store is not None:
-        _store.save_symbol_state(state)
-        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
-                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
-    autotune_gates(state)
-
 
 
 async def run_calibration(state, symbol_data, symbols, trigger_reason):
@@ -2440,18 +2142,6 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
             continue
         hit_rate, models, confidences = walk_forward_validate(sd)
         if models is not None:
-            # Blend in any Supabase-persisted weights as a warm-start
-            pending = state._pending_weights.get(s)
-            if pending:
-                if models.per_layer_weights is None:
-                    models.per_layer_weights = pending
-                else:
-                    all_keys = set(models.per_layer_weights) | set(pending)
-                    models.per_layer_weights = {
-                        k: round(0.7 * models.per_layer_weights.get(k, 1.0)
-                                 + 0.3 * pending.get(k, 1.0), 6)
-                        for k in all_keys
-                    }
             state.model_cache[s] = models
         state.reliability[s] = float(np.clip(hit_rate / 0.5, 0.3, 1.5))
         state.consecutive_losses[s] = 0
@@ -2480,13 +2170,6 @@ async def run_calibration(state, symbol_data, symbols, trigger_reason):
     state.last_activity = time.time()
     print(f"[Calibrator] complete in {state.last_calibration_end - start:.1f}s. Updated: {candidates}")
     state.trading_locked = False
-
-    # ── Persist all learned state to Supabase ──────────────────────────────
-    if _store is not None:
-        _store.save_symbol_state(state)
-        _store.save_gates(MIN_LAYER_AGREE, MAX_LAYER_DISAGREE,
-                          MIN_EXP_WIN_RATE, state.adaptive_threshold)
-    autotune_gates(state)
 
 
 # ---------------------------------------------------------------------------
@@ -2558,24 +2241,6 @@ async def main():
     state = TradeState()
     state.balance = account.get("balance", 0.0)
     print(f"Starting balance: {state.balance}")
-
-    # ── Supabase: init store and warm-start from persisted state ──────────
-    # This runs before calibration so the first calibration's model cache
-    # immediately has access to prior-learned layer weights (warm start),
-    # and tuned gate values from prior sessions override the compile-time
-    # defaults before any trade is evaluated.
-    global _store, MIN_LAYER_AGREE, MAX_LAYER_DISAGREE, MIN_EXP_WIN_RATE
-    _store = SupabaseStore()
-    _store.load_symbol_state(state)    # pre-seeds reliability, thresholds, win counts, pending weights
-    gates = _store.load_gates()
-    if gates:
-        MIN_LAYER_AGREE    = int(gates.get("min_layer_agree",    MIN_LAYER_AGREE))
-        MAX_LAYER_DISAGREE = int(gates.get("max_layer_disagree", MAX_LAYER_DISAGREE))
-        MIN_EXP_WIN_RATE   = float(gates.get("min_exp_win_rate", MIN_EXP_WIN_RATE))
-        state.adaptive_threshold = float(gates.get("adaptive_threshold", state.adaptive_threshold))
-        print(f"[Store] Restored gates: agree>={MIN_LAYER_AGREE} "
-              f"disagree<={MAX_LAYER_DISAGREE} MC>={MIN_EXP_WIN_RATE:.2f} "
-              f"thr={state.adaptive_threshold:.4f}")
 
     # --- R_ symbols ---
     r_symbols = []
